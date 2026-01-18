@@ -1,0 +1,21 @@
+{
+  "name": "cookingwdatabase",
+  "version": "1.0.0",
+  "description": "database for cookingwtristan",
+  "homepage": "https://github.com/g1lbert1/cookingwdatabase#readme",
+  "bugs": {
+    "url": "https://github.com/g1lbert1/cookingwdatabase/issues"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/g1lbert1/cookingwdatabase.git"
+  },
+  "license": "ISC",
+  "author": "Tristan Mikiewicz",
+  "main": "app.js",
+  "type": "module",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1",
+    "start": "node app.js"
+  }
+}
