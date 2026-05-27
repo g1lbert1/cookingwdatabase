@@ -17,5 +17,14 @@
   "scripts": {
     "test": "echo \"Error: no test specified\" && exit 1",
     "start": "node app.js"
+  },
+  "dependencies": {
+    "@apollo/server": "^5.2.0",
+    "express-jwt": "^8.5.1",
+    "graphql": "^16.12.0",
+    "jwks-rsa": "^3.2.2",
+    "mongodb": "^7.0.0",
+    "redis": "^5.10.0",
+    "slugify": "^1.6.9"
   }
 }
