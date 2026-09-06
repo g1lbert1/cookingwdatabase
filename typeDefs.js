@@ -32,7 +32,7 @@ export const typeDefs = `#graphql
     auth0Id: String!
     email: String!
     username: String!
-    avatar: String!
+    avatar: String
     createdAt: String!
     role: String!
   }
