@@ -59,3 +59,18 @@ user document.
   admin. If the admin signed up via a password connection, verify the email
   in Auth0 before first login.
 * `redis` is still an unused dependency, kept for the planned caching work.
+* The server now runs on Express (via `@as-integrations/express5`) so that
+  CORS can be restricted to `CORS_ORIGIN` and `/graphql` can be rate
+  limited. Introspection and error stack traces are disabled when
+  `NODE_ENV=production`. If you deploy behind a reverse proxy, set
+  `app.set('trust proxy', 1)` so the rate limiter sees real client IPs.
+* Startup creates unique indexes on `recipes.slug` and `users.auth0Id` and
+  fails fast if Mongo is unreachable. If existing data already contains
+  duplicate slugs or auth0Ids, index creation throws and you must dedupe first.
+* Recipe input is validated in `helpers.validateRecipeInput`: non-empty
+  trimmed title (max 200 chars) that yields a usable slug, non-negative integer
+  prepTime, at least one ingredient with a non-empty name and non-negative
+  amount, and at least one non-empty instruction step. A title that collides
+  with an existing slug returns `BAD_USER_INPUT`.
+* Slugs are generated and looked up with the same `slugify` settings, so
+  accented titles round-trip ("Crème" stores and resolves as "creme").
