@@ -3,7 +3,6 @@ import helpers from './helpers.js';
 import { authConfig } from './config/settings.js';
 import { recipes as recipeCollection } from './config/mongoCollections.js';
 import { users as userCollection } from './config/mongoCollections.js';
-import slugify from "slugify";
 
 //Pulls profile fields out of the access token.
 //These only exist if an Auth0 Action adds them as namespaced custom claims --
@@ -62,6 +61,14 @@ const serializeRecipe = (recipe) => ({
   ...recipe,
   _id: recipe._id.toString()
 });
+
+//Mongo raises E11000 when a write violates the unique slug index. Two recipes
+//with the same title would otherwise be indistinguishable by URL.
+const isDuplicateKey = (e) => e?.code === 11000;
+const duplicateTitleError = (title) =>
+  new GraphQLError(`A recipe titled "${title}" already exists. Choose a different title.`, {
+    extensions: {code: 'BAD_USER_INPUT'}
+  });
 
 export const resolvers = {
   //Query Resolver
@@ -138,15 +145,15 @@ export const resolvers = {
     createRecipe: async (_, { input }, context) => {
       await requireAdmin(context);
 
+      const recipe = helpers.validateRecipeInput(input);
       const recipeList = await recipeCollection();
-      const recipe = {
-        ...input,
-        slug: slugify(input.title, {
-            lower: true,
-            strict: true
-        })
-      };
-      const insertInfo = await recipeList.insertOne(recipe);
+      let insertInfo;
+      try {
+        insertInfo = await recipeList.insertOne(recipe);
+      } catch (e) {
+        if(isDuplicateKey(e)) throw duplicateTitleError(recipe.title);
+        throw e;
+      }
       return {
         ...recipe,
         _id: insertInfo.insertedId.toString()
@@ -157,15 +164,19 @@ export const resolvers = {
       await requireAdmin(context);
 
       const objectId = helpers.validateId(_id);
+      const recipe = helpers.validateRecipeInput(input);
       const recipeList = await recipeCollection();
-      const updated = await recipeList.findOneAndUpdate(
-        { _id: objectId },
-        { $set: {
-          ...input,
-          slug: slugify(input.title, { lower: true, strict: true })
-        } },
-        { returnDocument: 'after' }
-      );
+      let updated;
+      try {
+        updated = await recipeList.findOneAndUpdate(
+          { _id: objectId },
+          { $set: recipe },
+          { returnDocument: 'after' }
+        );
+      } catch (e) {
+        if(isDuplicateKey(e)) throw duplicateTitleError(recipe.title);
+        throw e;
+      }
       if(!updated){
         throw new GraphQLError('Recipe Not Found', {
           extensions: {code: 'NOT_FOUND'}

@@ -12,6 +12,8 @@ const required = (key) => {
   return value;
 };
 
+export const isProduction = process.env.NODE_ENV === 'production';
+
 export const mongoConfig = {
   serverUrl: process.env.MONGO_URL || 'mongodb://localhost:27017/',
   database: process.env.MONGO_DB || 'cookingwdatabase'
@@ -31,5 +33,18 @@ export const authConfig = {
 
 export const serverConfig = {
   port: Number(process.env.PORT) || 4000,
-  host: process.env.HOST || '0.0.0.0'
+  host: process.env.HOST || '0.0.0.0',
+  // Comma-separated list of browser origins allowed to call the API.
+  // Defaults to the Vite dev server. The API uses bearer tokens, not cookies,
+  // so a wildcard would not leak sessions, but it still lets any site drive
+  // the API with a token it has obtained and hides misconfigured deployments.
+  corsOrigins: (process.env.CORS_ORIGIN || 'http://localhost:5173')
+    .split(',')
+    .map((o) => o.trim())
+    .filter(Boolean),
+  // Requests per IP per window. Generous for a recipe site; tighten if abused.
+  rateLimit: {
+    windowMs: 15 * 60 * 1000,
+    max: Number(process.env.RATE_LIMIT_MAX) || 300
+  }
 };
