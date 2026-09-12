@@ -61,8 +61,20 @@ export const typeDefs = `#graphql
     notes: String
   }
 
+  # Everything the browser needs to upload one photo straight to Cloudinary.
+  # The signature is computed server-side from the API secret and is valid
+  # for about an hour; the resulting secure_url goes into RecipeInput.imageUrl.
+  type ImageUploadSignature {
+    cloudName: String!
+    apiKey: String!
+    timestamp: Int!
+    signature: String!
+    folder: String!
+  }
+
   type Mutation {
     createRecipe(input: RecipeInput!): Recipe!
+    createImageUploadSignature: ImageUploadSignature!
     updateRecipe(_id: String!, input: RecipeInput!): Recipe!
     deleteRecipe(_id: String!): Boolean!
   }

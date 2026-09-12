@@ -48,3 +48,17 @@ export const serverConfig = {
     max: Number(process.env.RATE_LIMIT_MAX) || 300
   }
 };
+
+// Cloudinary signs admin photo uploads from the recipe form. Optional: when
+// unset, the upload mutation returns a clear error and everything else works.
+// The secret never leaves the server; the browser only receives a signature.
+const cloudName = process.env.CLOUDINARY_CLOUD_NAME;
+export const cloudinaryConfig = cloudName
+  ? {
+      cloudName,
+      apiKey: required('CLOUDINARY_API_KEY'),
+      apiSecret: required('CLOUDINARY_API_SECRET'),
+      // Keeps uploads for this site grouped in the Cloudinary media library.
+      folder: process.env.CLOUDINARY_FOLDER || 'cookingwtristan'
+    }
+  : null;
