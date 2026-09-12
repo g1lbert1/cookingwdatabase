@@ -25,6 +25,7 @@ export const typeDefs = `#graphql
     instructions: [String!]!
     prepTime: Int!
     content: String
+    imageUrl: String
   }
 
   type User {
@@ -50,6 +51,7 @@ export const typeDefs = `#graphql
     instructions: [String!]!
     prepTime: Int!
     content: String
+    imageUrl: String
   }
 
   input IngredientInput {
