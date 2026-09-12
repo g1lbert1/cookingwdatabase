@@ -72,5 +72,10 @@ user document.
   prepTime, at least one ingredient with a non-empty name and non-negative
   amount, and at least one non-empty instruction step. A title that collides
   with an existing slug returns `BAD_USER_INPUT`.
+* Recipes have an optional `imageUrl`. It must be an absolute http(s) URL or
+  a root-relative path (e.g. `/carbonara.jpg` for a file in the frontend's
+  `public/` folder). Other schemes such as `javascript:` and `data:` are
+  rejected, so the value is always safe to use as an `<img src>`. Photos are
+  not uploaded through the API; host them yourself and store the link.
 * Slugs are generated and looked up with the same `slugify` settings, so
   accented titles round-trip ("Crème" stores and resolves as "creme").
