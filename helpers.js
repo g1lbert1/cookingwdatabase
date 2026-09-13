@@ -17,8 +17,37 @@ const requireNonEmptyString = (value, label) => {
   return value.trim();
 };
 
+// Photos are either hosted elsewhere (absolute http/https URL) or served from
+// the frontend's public folder (root-relative path like "/carbonara.jpg").
+// Anything else, including javascript: and data: URLs, is rejected so the
+// stored value is always safe to drop straight into an <img src>.
+const validateImageUrl = (value) => {
+  if (value == null) return null;
+  if (typeof value !== 'string') throw badInput('imageUrl must be a string.');
+  const trimmed = value.trim();
+  if (!trimmed) return null;
+  if (trimmed.length > 2048) throw badInput('imageUrl must be 2048 characters or fewer.');
+  if (/\s/.test(trimmed)) throw badInput('imageUrl must not contain whitespace.');
+
+  if (trimmed.startsWith('/')) {
+    if (trimmed.startsWith('//')) throw badInput('imageUrl must be an http(s) URL or a path starting with "/".');
+    return trimmed;
+  }
+  let parsed;
+  try {
+    parsed = new URL(trimmed);
+  } catch {
+    throw badInput('imageUrl must be an http(s) URL or a path starting with "/".');
+  }
+  if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
+    throw badInput('imageUrl must use http or https.');
+  }
+  return trimmed;
+};
+
 const exportedHelpers = {
   makeSlug,
+  validateImageUrl,
 
   validateSlug (slug) {
     const trimmed = requireNonEmptyString(slug, 'Slug');
@@ -74,8 +103,17 @@ const exportedHelpers = {
     );
 
     const content = typeof input.content === 'string' ? input.content.trim() : null;
+    const imageUrl = validateImageUrl(input.imageUrl);
 
-    return { title, slug, prepTime: input.prepTime, ingredients, instructions, content: content || null };
+    return {
+      title,
+      slug,
+      prepTime: input.prepTime,
+      ingredients,
+      instructions,
+      content: content || null,
+      imageUrl
+    };
   }
 };
 
