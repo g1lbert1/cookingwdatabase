@@ -62,8 +62,8 @@ user document.
 * The server now runs on Express (via `@as-integrations/express5`) so that
   CORS can be restricted to `CORS_ORIGIN` and `/graphql` can be rate
   limited. Introspection and error stack traces are disabled when
-  `NODE_ENV=production`. If you deploy behind a reverse proxy, set
-  `app.set('trust proxy', 1)` so the rate limiter sees real client IPs.
+  `NODE_ENV=production`, which also enables `trust proxy` (one hop) so the
+  rate limiter sees real client IPs behind the host's reverse proxy.
 * Startup creates unique indexes on `recipes.slug` and `users.auth0Id` and
   fails fast if Mongo is unreachable. If existing data already contains
   duplicate slugs or auth0Ids, index creation throws and you must dedupe first.

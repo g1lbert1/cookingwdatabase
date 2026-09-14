@@ -61,6 +61,10 @@ const buildContext = async ({ req }) => {
 await ensureIndexes();
 
 const app = express();
+// Hosts like Render and Railway terminate TLS at a proxy and forward the real
+// client IP in X-Forwarded-For. Without this the rate limiter would count every
+// request as coming from the proxy. Only trust the first hop.
+if (isProduction) app.set('trust proxy', 1);
 const httpServer = http.createServer(app);
 
 const server = new ApolloServer({
