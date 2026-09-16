@@ -52,7 +52,9 @@ user document.
   mongo driver drops `undefined` keys), which made `me` fail forever for them.
   `me` now repairs those records in place on next login.
 * `ADMIN_EMAIL` must match the token's email claim, or nobody is admin and
-  `createRecipe` returns `FORBIDDEN` for everyone.
+  `createRecipe` returns `FORBIDDEN` for everyone. The check runs on every
+  `me` call, not just when the user record is first created, so setting or
+  changing `ADMIN_EMAIL` promotes the matching account on its next login.
 * Admin promotion also requires the `email_verified` claim to be `true`. Auth0
   only enforces email uniqueness per connection, so without this check anyone
   could register a password account under the admin address and be seeded as
