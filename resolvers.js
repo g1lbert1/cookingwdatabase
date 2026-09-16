@@ -37,6 +37,14 @@ const requireProfile = (profile) => {
   return profile;
 };
 
+//The configured ADMIN_EMAIL is the source of truth for who is admin. Only a
+//verified email counts: Auth0 enforces uniqueness per connection, so an
+//unverified password signup could otherwise claim any address.
+const isConfiguredAdmin = (profile) =>
+  Boolean(authConfig.adminEmail) &&
+  profile.emailVerified &&
+  profile.email === authConfig.adminEmail;
+
 const requireUser = (context) => {
   if(!context.user){
     throw new GraphQLError(`User must be logged in`, {
@@ -122,12 +130,7 @@ export const resolvers = {
           username: profile.username,
           avatar: profile.avatar,
           createdAt: new Date().toISOString(),
-          role:
-            authConfig.adminEmail &&
-            profile.emailVerified &&
-            profile.email === authConfig.adminEmail
-              ? "admin"
-              : "user"
+          role: isConfiguredAdmin(profile) ? "admin" : "user"
         };
         const insertInfo = await userList.insertOne(newUser);
         currentUser = await userList.findOne({ _id: insertInfo.insertedId });
@@ -144,6 +147,14 @@ export const resolvers = {
           } }
         );
         currentUser = await userList.findOne({ _id: currentUser._id });
+      }
+
+      //Re-check on every login rather than only at creation. Otherwise an
+      //account created before ADMIN_EMAIL was set (or against a fresh
+      //database) is stuck as "user" until someone edits Mongo by hand.
+      if(currentUser.role !== "admin" && isConfiguredAdmin(profile)){
+        await userList.updateOne({ _id: currentUser._id }, { $set: { role: "admin" } });
+        currentUser = { ...currentUser, role: "admin" };
       }
 
       return {
