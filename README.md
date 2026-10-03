@@ -144,13 +144,30 @@ enforces it server-side no matter what a client sends:
   and a failure is logged, never surfaced, so a Cloudinary hiccup cannot
   cost a user their edit. Only URLs in this cloud and folder are touched.
 
+* Orphan sweep (`orphanSweep.js`): a photo uploaded but never saved (an
+  abandoned form, or "Replace photo" used twice before saving) is tied to
+  no recipe, so the per-mutation cleanup never sees it. The sweep lists the
+  folder through the Admin API and deletes assets that are (a) tagged
+  `user_<id>`, i.e. uploaded through this API, (b) referenced by no
+  `recipes.imageUrl`, and (c) older than `ORPHAN_SWEEP_GRACE_HOURS`
+  (default 24). Untagged assets, which includes everything uploaded before
+  tagging existed and anything placed in the folder by hand, are never
+  touched. It runs a minute after boot and then daily when
+  `ORPHAN_SWEEP=on` (the default in production), and by hand with
+  `npm run sweep-orphans` (dry run; add `-- --delete` to remove,
+  `-- --grace=48` to widen the grace period).
+
+  **One folder, one database.** The sweep's reference set is whatever
+  database this process is connected to, while the Cloudinary folder is
+  shared by every environment using the account. A sweep from a laptop
+  pointed at the production folder would treat production photos as
+  orphans. Give development its own `CLOUDINARY_FOLDER` (for example
+  `cookingwtristan-dev`); that is also why the automatic sweep is off
+  outside production.
+
 Still open, on purpose:
 * No content moderation. Cloudinary's AWS Rekognition moderation add-on can
   be turned on by signing `moderation=aws_rek`; it is paid.
-* A photo uploaded but never saved (abandoned form, or "Replace photo" used
-  twice before saving) is not tracked and stays in Cloudinary. The per-user
-  `user_<id>` tag makes those findable; a periodic sweep via the Admin API
-  comparing tagged assets against `recipes.imageUrl` would remove them.
 
 In the Cloudinary console (Settings → Security / Upload) keep **unsigned
 uploads disabled**, leave the default upload preset signed, and consider

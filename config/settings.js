@@ -72,3 +72,16 @@ export const cloudinaryConfig = cloudName
       signaturesPerHour: Number(process.env.UPLOAD_SIGNATURES_PER_HOUR) || 20
     }
   : null;
+
+// Daily sweep of uploaded-but-never-saved photos (see orphanSweep.js). On by
+// default only in production: the folder is shared by every environment that
+// uses the same Cloudinary account, and a sweep must run against the database
+// that owns the folder. Set ORPHAN_SWEEP=on|off to override either way.
+export const orphanSweepConfig = {
+  enabled: process.env.ORPHAN_SWEEP
+    ? process.env.ORPHAN_SWEEP.toLowerCase() === 'on'
+    : isProduction,
+  // Uploads newer than this are never touched; it is how long a form may sit
+  // open with a photo attached before it is at risk.
+  graceHours: Number(process.env.ORPHAN_SWEEP_GRACE_HOURS) || 24
+};

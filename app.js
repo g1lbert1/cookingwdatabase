@@ -10,8 +10,9 @@ import jwksClient from 'jwks-rsa';
 
 import { typeDefs } from './typeDefs.js';
 import { resolvers } from './resolvers.js';
-import { authConfig, serverConfig, isProduction } from './config/settings.js';
+import { authConfig, serverConfig, cloudinaryConfig, orphanSweepConfig, isProduction } from './config/settings.js';
 import { ensureIndexes, backfillRecipeDefaults } from './config/indexes.js';
+import { scheduleOrphanSweep } from './orphanSweep.js';
 
 const client = jwksClient({
   jwksUri: authConfig.jwksUri
@@ -99,6 +100,13 @@ await new Promise((resolve) =>
 );
 console.log(`🚀  Server ready at: http://${serverConfig.host}:${serverConfig.port}/graphql`);
 console.log(`    CORS origins: ${serverConfig.corsOrigins.join(', ')} | introspection: ${!isProduction}`);
+
+// Photos uploaded from forms that were never submitted are not tied to any
+// recipe; a daily sweep removes them once they are past the grace period.
+if (cloudinaryConfig && orphanSweepConfig.enabled) {
+  scheduleOrphanSweep({ graceHours: orphanSweepConfig.graceHours });
+  console.log(`    Orphan photo sweep: daily, grace ${orphanSweepConfig.graceHours}h`);
+}
 
 // Installed only after a successful listen, so startup failures (EADDRINUSE,
 // bad config, Mongo down) still fail loudly instead of hanging. Once serving, a

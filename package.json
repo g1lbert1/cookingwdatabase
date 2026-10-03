@@ -16,7 +16,8 @@
   "type": "module",
   "scripts": {
     "test": "echo \"Error: no test specified\" && exit 1",
-    "start": "node --env-file-if-exists=.env app.js"
+    "start": "node --env-file-if-exists=.env app.js",
+    "sweep-orphans": "node --env-file-if-exists=.env scripts/sweepOrphans.js"
   },
   "dependencies": {
     "@apollo/server": "^5.2.0",
