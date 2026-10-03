@@ -1,7 +1,7 @@
 import { GraphQLError } from 'graphql';
 import { ObjectId } from 'mongodb';
 import slugify from 'slugify';
-import { cloudinaryConfig } from './config/settings.js';
+import { publicIdFromUrl } from './cloudinary.js';
 
 const badInput = (message) =>
   new GraphQLError(message, { extensions: { code: 'BAD_USER_INPUT' } });
@@ -18,23 +18,12 @@ const requireNonEmptyString = (value, label) => {
   return value.trim();
 };
 
-const escapeRegExp = (s) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-
 // Photos come from exactly two places: this site's own Cloudinary folder
-// (what the upload flow produces) or the frontend's public folder as a
-// root-relative path like "/carbonara.jpg". Anything else is refused, which
-// closes off hotlinking arbitrary third-party images (tracking pixels,
-// content nobody here controls) as well as javascript: and data: URLs.
-// The Cloudinary form is pinned to the bare delivery URL with no
-// transformation segment: the frontend adds its own display transformations.
-const ownCloudinaryUrl = cloudinaryConfig
-  ? new RegExp(
-      `^https://res\\.cloudinary\\.com/${escapeRegExp(cloudinaryConfig.cloudName)}` +
-      `/image/upload/(?:v\\d+/)?${escapeRegExp(cloudinaryConfig.folder)}/[A-Za-z0-9_-]+` +
-      `\\.(?:${cloudinaryConfig.allowedFormats.concat('jpeg').join('|')})$`
-    )
-  : null;
-
+// (what the upload flow produces; see cloudinary.js for the exact shape) or
+// the frontend's public folder as a root-relative path like "/carbonara.jpg".
+// Anything else is refused, which closes off hotlinking arbitrary
+// third-party images (tracking pixels, content nobody here controls) as
+// well as javascript: and data: URLs.
 const validateImageUrl = (value) => {
   if (value == null) return null;
   if (typeof value !== 'string') throw badInput('imageUrl must be a string.');
@@ -47,7 +36,7 @@ const validateImageUrl = (value) => {
     if (trimmed.startsWith('//')) throw badInput('imageUrl must be a photo uploaded here or a path starting with "/".');
     return trimmed;
   }
-  if (ownCloudinaryUrl && ownCloudinaryUrl.test(trimmed)) return trimmed;
+  if (publicIdFromUrl(trimmed)) return trimmed;
   throw badInput('imageUrl must be a photo uploaded through this site or a path starting with "/".');
 };
 

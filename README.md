@@ -138,11 +138,19 @@ enforces it server-side no matter what a client sends:
   transformation segments and `raw`/`video` URLs are all rejected, so nobody
   can hotlink a tracking pixel or unmoderated content into the list.
 
+* Orphan cleanup: when a recipe is deleted, or an edit replaces or removes
+  its photo, the server calls Cloudinary's signed `destroy` for the old
+  asset (`cloudinary.js`). Best effort: it runs after the database change
+  and a failure is logged, never surfaced, so a Cloudinary hiccup cannot
+  cost a user their edit. Only URLs in this cloud and folder are touched.
+
 Still open, on purpose:
 * No content moderation. Cloudinary's AWS Rekognition moderation add-on can
   be turned on by signing `moderation=aws_rek`; it is paid.
-* Replaced or deleted recipe photos are not removed from Cloudinary. A
-  server-side `destroy` call on `deleteRecipe` would need the Admin API.
+* A photo uploaded but never saved (abandoned form, or "Replace photo" used
+  twice before saving) is not tracked and stays in Cloudinary. The per-user
+  `user_<id>` tag makes those findable; a periodic sweep via the Admin API
+  comparing tagged assets against `recipes.imageUrl` would remove them.
 
 In the Cloudinary console (Settings → Security / Upload) keep **unsigned
 uploads disabled**, leave the default upload preset signed, and consider

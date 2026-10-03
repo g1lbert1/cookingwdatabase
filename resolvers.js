@@ -1,7 +1,8 @@
-import { createHash, randomBytes } from 'node:crypto';
+import { randomBytes } from 'node:crypto';
 import { GraphQLError } from 'graphql';
 import { ObjectId } from 'mongodb';
 import helpers from './helpers.js';
+import { signParams, cloudinary } from './cloudinary.js';
 import { authConfig, cloudinaryConfig } from './config/settings.js';
 import {
   recipes as recipeCollection,
@@ -343,18 +344,6 @@ const takeSignatureSlot = (userId) => {
   }
 };
 
-//Cloudinary signed-upload scheme: sort the params to sign alphabetically,
-//join as key=value&..., append the API secret, SHA-1 the result. The browser
-//sends the same params plus the signature; Cloudinary recomputes and compares.
-//https://cloudinary.com/documentation/upload_images#generating_authentication_signatures
-const signUploadParams = (params, secret) => {
-  const toSign = Object.keys(params)
-    .sort()
-    .map((k) => `${k}=${params[k]}`)
-    .join('&');
-  return createHash('sha1').update(toSign + secret).digest('hex');
-};
-
 export const resolvers = {
   //Query Resolver
   Query: {
@@ -454,6 +443,11 @@ export const resolvers = {
         )
       );
       if(!updated) throw notFound();
+      //A replaced or removed photo would otherwise sit in Cloudinary forever.
+      //Runs after the edit is committed and never fails it.
+      if(existing.imageUrl && existing.imageUrl !== updated.imageUrl){
+        await cloudinary.destroyImage(existing.imageUrl);
+      }
       const [presented] = await present([updated], user);
       return presented;
     },
@@ -487,7 +481,7 @@ export const resolvers = {
         tags: `user_${user._id.toString()}`
       };
       const fields = Object.entries(params).map(([name, value]) => ({ name, value: String(value) }));
-      fields.push({ name: 'signature', value: signUploadParams(params, cloudinaryConfig.apiSecret) });
+      fields.push({ name: 'signature', value: signParams(params, cloudinaryConfig.apiSecret) });
       return {
         cloudName: cloudinaryConfig.cloudName,
         apiKey: cloudinaryConfig.apiKey,
@@ -507,7 +501,9 @@ export const resolvers = {
       await Promise.all([
         likeList.deleteMany({ recipeId: recipe._id }),
         favoriteList.deleteMany({ recipeId: recipe._id }),
-        commentList.deleteMany({ recipeId: recipe._id })
+        commentList.deleteMany({ recipeId: recipe._id }),
+        //The photo too. Best effort; see cloudinary.js.
+        recipe.imageUrl ? cloudinary.destroyImage(recipe.imageUrl) : null
       ]);
       return true;
     },
