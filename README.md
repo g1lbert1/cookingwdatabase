@@ -110,10 +110,44 @@ site's own, most liked first.
   `public/` folder). Other schemes such as `javascript:` and `data:` are
   rejected, so the value is always safe to use as an `<img src>`.
 * Photos are uploaded from the browser straight to Cloudinary, not through
-  this API. The admin-only `createImageUploadSignature` mutation returns the
-  cloud name, API key, timestamp, folder and a SHA-1 signature computed with
-  `CLOUDINARY_API_SECRET`; the browser posts the file plus those fields to
-  Cloudinary and stores the returned `secure_url` in `imageUrl`. Set the
-  three `CLOUDINARY_*` variables to enable it (see `.env.example`).
+  this API. `createImageUploadSignature` (any signed-in user) returns the
+  cloud name, API key and a list of signed fields; the browser posts the file
+  plus those fields verbatim and stores the returned `secure_url` in
+  `imageUrl`. Set the three `CLOUDINARY_*` variables to enable it.
+
+### Upload safeguards
+Everything that constrains an upload is inside the signature, so Cloudinary
+enforces it server-side no matter what a client sends:
+
+* `allowed_formats` = jpg, png, webp, heic, avif. No SVG (scriptable), no GIF,
+  no raw files. A disallowed file is rejected before it is stored.
+* `transformation` = `c_limit,w_2400,h_2400,q_auto:good`, applied on the way
+  in. The file is re-encoded (which drops EXIF/GPS and anything hidden in the
+  container) and capped in size at rest.
+* `public_id` = a random id per signature. Signatures stay valid for about an
+  hour and can be replayed; pinning the id means a replay can only overwrite
+  that one asset rather than mint unlimited new ones.
+* `tags` = `user_<mongo id>`, so one search in the Cloudinary console finds
+  (and can purge) everything a given account uploaded.
+* Per-user quota: `UPLOAD_SIGNATURES_PER_HOUR` (default 20) signatures per
+  user per sliding hour, kept in process memory, `RATE_LIMITED` beyond it.
+  With more than one API instance this belongs in a shared store.
+* `imageUrl` on a recipe must be either a root-relative path (`/x.jpg` in the
+  frontend's public folder) or a bare delivery URL in this cloud and folder
+  with an allowed extension. Third-party hosts, other clouds or folders,
+  transformation segments and `raw`/`video` URLs are all rejected, so nobody
+  can hotlink a tracking pixel or unmoderated content into the list.
+
+Still open, on purpose:
+* No content moderation. Cloudinary's AWS Rekognition moderation add-on can
+  be turned on by signing `moderation=aws_rek`; it is paid.
+* Replaced or deleted recipe photos are not removed from Cloudinary. A
+  server-side `destroy` call on `deleteRecipe` would need the Admin API.
+
+In the Cloudinary console (Settings → Security / Upload) keep **unsigned
+uploads disabled**, leave the default upload preset signed, and consider
+**Strict transformations** off only because the frontend builds display
+transformations client-side.
+
 * Slugs are generated and looked up with the same `slugify` settings, so
   accented titles round-trip ("Crème" stores and resolves as "creme").

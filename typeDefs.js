@@ -95,14 +95,19 @@ export const typeDefs = `#graphql
   }
 
   # Everything the browser needs to upload one photo straight to Cloudinary.
-  # The signature is computed server-side from the API secret and is valid
-  # for about an hour; the resulting secure_url goes into RecipeInput.imageUrl.
+  # The browser posts the file plus every field verbatim; the fields are
+  # signed server-side, so Cloudinary enforces them (one fixed asset id,
+  # allowed formats, size-capping transformation) and rejects anything else.
+  # The resulting secure_url goes into RecipeInput.imageUrl.
   type ImageUploadSignature {
     cloudName: String!
     apiKey: String!
-    timestamp: Int!
-    signature: String!
-    folder: String!
+    fields: [UploadField!]!
+  }
+
+  type UploadField {
+    name: String!
+    value: String!
   }
 
   # createRecipe and createImageUploadSignature need a signed-in user.

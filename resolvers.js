@@ -318,6 +318,31 @@ const retryOnSlugCollision = async (recipe, write) => {
   throw duplicateTitleError(recipe.title);
 };
 
+//Per-user cap on upload signatures, a sliding one-hour window kept in memory.
+//Each signature is good for one stored asset, so this is also the per-user
+//storage growth cap. Process-local: with several API instances each would
+//allow the full quota, which is the point at which this belongs in Redis.
+const signatureWindowMs = 60 * 60 * 1000;
+const signatureIssued = new Map();
+const takeSignatureSlot = (userId) => {
+  const now = Date.now();
+  const recent = (signatureIssued.get(userId) ?? []).filter((t) => now - t < signatureWindowMs);
+  if(recent.length >= cloudinaryConfig.signaturesPerHour){
+    throw new GraphQLError(
+      `You have uploaded a lot of photos recently. Try again in a little while.`,
+      { extensions: { code: 'RATE_LIMITED' } }
+    );
+  }
+  recent.push(now);
+  signatureIssued.set(userId, recent);
+  //Keep the map from growing with every user who ever uploaded.
+  if(signatureIssued.size > 10000){
+    for(const [id, times] of signatureIssued){
+      if(times.every((t) => now - t >= signatureWindowMs)) signatureIssued.delete(id);
+    }
+  }
+};
+
 //Cloudinary signed-upload scheme: sort the params to sign alphabetically,
 //join as key=value&..., append the API secret, SHA-1 the result. The browser
 //sends the same params plus the signature; Cloudinary recomputes and compares.
@@ -433,24 +458,40 @@ export const resolvers = {
       return presented;
     },
 
-    //Anyone signed in may upload a photo for their recipe. The secret still
-    //never leaves the server; the rate limiter bounds abuse.
+    //Anyone signed in may upload a photo for their recipe. The secret never
+    //leaves the server, and every constraint below is inside the signature,
+    //so Cloudinary itself enforces it: a client cannot widen the formats,
+    //skip the transformation, or point the upload at another asset id.
     createImageUploadSignature: async (_, __, context) => {
-      await requireAccount(context);
+      const user = await requireAccount(context);
 
       if(!cloudinaryConfig){
         throw new GraphQLError('Photo uploads are not configured on this server.', {
           extensions: { code: 'UPLOADS_DISABLED' }
         });
       }
+      takeSignatureSlot(user._id.toString());
+
       const timestamp = Math.floor(Date.now() / 1000);
-      const params = { folder: cloudinaryConfig.folder, timestamp };
+      const params = {
+        timestamp,
+        folder: cloudinaryConfig.folder,
+        //A fixed, random asset id. Cloudinary signatures stay valid for about
+        //an hour and can be replayed; with the id pinned, a replay can only
+        //overwrite this one asset instead of minting unlimited new ones.
+        public_id: randomBytes(12).toString('hex'),
+        allowed_formats: cloudinaryConfig.allowedFormats.join(','),
+        transformation: cloudinaryConfig.incomingTransformation,
+        //Who uploaded it, so an abuser's assets can be found and purged in
+        //one search from the Cloudinary console.
+        tags: `user_${user._id.toString()}`
+      };
+      const fields = Object.entries(params).map(([name, value]) => ({ name, value: String(value) }));
+      fields.push({ name: 'signature', value: signUploadParams(params, cloudinaryConfig.apiSecret) });
       return {
         cloudName: cloudinaryConfig.cloudName,
         apiKey: cloudinaryConfig.apiKey,
-        timestamp,
-        signature: signUploadParams(params, cloudinaryConfig.apiSecret),
-        folder: cloudinaryConfig.folder
+        fields
       };
     },
 
