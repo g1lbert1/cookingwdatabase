@@ -1,6 +1,7 @@
 import { GraphQLError } from 'graphql';
 import { ObjectId } from 'mongodb';
 import slugify from 'slugify';
+import { publicIdFromUrl } from './cloudinary.js';
 
 const badInput = (message) =>
   new GraphQLError(message, { extensions: { code: 'BAD_USER_INPUT' } });
@@ -17,10 +18,12 @@ const requireNonEmptyString = (value, label) => {
   return value.trim();
 };
 
-// Photos are either hosted elsewhere (absolute http/https URL) or served from
-// the frontend's public folder (root-relative path like "/carbonara.jpg").
-// Anything else, including javascript: and data: URLs, is rejected so the
-// stored value is always safe to drop straight into an <img src>.
+// Photos come from exactly two places: this site's own Cloudinary folder
+// (what the upload flow produces; see cloudinary.js for the exact shape) or
+// the frontend's public folder as a root-relative path like "/carbonara.jpg".
+// Anything else is refused, which closes off hotlinking arbitrary
+// third-party images (tracking pixels, content nobody here controls) as
+// well as javascript: and data: URLs.
 const validateImageUrl = (value) => {
   if (value == null) return null;
   if (typeof value !== 'string') throw badInput('imageUrl must be a string.');
@@ -30,19 +33,11 @@ const validateImageUrl = (value) => {
   if (/\s/.test(trimmed)) throw badInput('imageUrl must not contain whitespace.');
 
   if (trimmed.startsWith('/')) {
-    if (trimmed.startsWith('//')) throw badInput('imageUrl must be an http(s) URL or a path starting with "/".');
+    if (trimmed.startsWith('//')) throw badInput('imageUrl must be a photo uploaded here or a path starting with "/".');
     return trimmed;
   }
-  let parsed;
-  try {
-    parsed = new URL(trimmed);
-  } catch {
-    throw badInput('imageUrl must be an http(s) URL or a path starting with "/".');
-  }
-  if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
-    throw badInput('imageUrl must use http or https.');
-  }
-  return trimmed;
+  if (publicIdFromUrl(trimmed)) return trimmed;
+  throw badInput('imageUrl must be a photo uploaded through this site or a path starting with "/".');
 };
 
 const exportedHelpers = {
@@ -54,6 +49,14 @@ const exportedHelpers = {
     const normalized = makeSlug(trimmed);
     if (!normalized) throw badInput(`Slug "${slug}" contains no usable characters.`);
     return normalized;
+  },
+
+  //Comments are plain text, trimmed. The limit keeps a thread readable and
+  //the document small; the schema only guarantees a String.
+  validateCommentBody (body) {
+    const trimmed = requireNonEmptyString(body, 'Comment');
+    if (trimmed.length > 1000) throw badInput('Comments must be 1000 characters or fewer.');
+    return trimmed;
   },
 
   //Guards ObjectId construction, which throws a raw BSONError on bad input.
