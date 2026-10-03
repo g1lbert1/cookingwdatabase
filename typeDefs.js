@@ -35,6 +35,18 @@ export const typeDefs = `#graphql
     # The viewer's own reactions. Always false when not signed in.
     likedByMe: Boolean!
     favoritedByMe: Boolean!
+    commentCount: Int!
+    # Oldest first, so a thread reads top to bottom. Only fetched when asked.
+    comments: [Comment!]!
+  }
+
+  type Comment {
+    _id: String!
+    body: String!
+    createdAt: String!
+    author: Author
+    # True for the comment's author, the recipe's author, and admins.
+    canDelete: Boolean!
   }
 
   # The public face of a user, safe to show on anyone's recipe. User (below)
@@ -107,5 +119,9 @@ export const typeDefs = `#graphql
     unlikeRecipe(_id: String!): Recipe!
     favoriteRecipe(_id: String!): Recipe!
     unfavoriteRecipe(_id: String!): Recipe!
+    # Signed-in users. body is trimmed and must be 1 to 1000 characters.
+    addComment(recipeId: String!, body: String!): Comment!
+    # The comment's author, the recipe's author, or an admin.
+    deleteComment(_id: String!): Boolean!
   }
 `;

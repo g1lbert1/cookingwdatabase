@@ -56,6 +56,14 @@ const exportedHelpers = {
     return normalized;
   },
 
+  //Comments are plain text, trimmed. The limit keeps a thread readable and
+  //the document small; the schema only guarantees a String.
+  validateCommentBody (body) {
+    const trimmed = requireNonEmptyString(body, 'Comment');
+    if (trimmed.length > 1000) throw badInput('Comments must be 1000 characters or fewer.');
+    return trimmed;
+  },
+
   //Guards ObjectId construction, which throws a raw BSONError on bad input.
   validateId (id) {
     const trimmed = requireNonEmptyString(id, '_id');

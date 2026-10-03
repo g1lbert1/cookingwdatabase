@@ -1,4 +1,4 @@
-import { recipes, users, likes, favorites } from './mongoCollections.js';
+import { recipes, users, likes, favorites, comments } from './mongoCollections.js';
 
 // Called once at startup. createIndex is idempotent, so restarting is safe.
 // - recipes.slug unique: two recipes with the same title would otherwise share
@@ -10,9 +10,11 @@ import { recipes, users, likes, favorites } from './mongoCollections.js';
 // - likes/favorites (recipeId, userId) unique: a double-tap inserts nothing
 //   and recipes.likeCount can only move once per user. The userId index
 //   backs the profile's "liked" and "favorites" tabs, newest first.
+// - comments (recipeId, createdAt): the recipe page reads a thread in order.
 export const ensureIndexes = async () => {
   const recipeList = await recipes();
   const userList = await users();
+  const commentList = await comments();
   const reactionIndexes = async (rows) => {
     await rows.createIndex({ recipeId: 1, userId: 1 }, { unique: true, name: 'recipe_user_unique' });
     await rows.createIndex({ userId: 1, createdAt: -1 }, { name: 'user_recent' });
@@ -23,7 +25,9 @@ export const ensureIndexes = async () => {
     recipeList.createIndex({ authorId: 1 }, { name: 'authorId' }),
     userList.createIndex({ auth0Id: 1 }, { unique: true, name: 'auth0Id_unique' }),
     reactionIndexes(await likes()),
-    reactionIndexes(await favorites())
+    reactionIndexes(await favorites()),
+    commentList.createIndex({ recipeId: 1, createdAt: 1 }, { name: 'recipe_thread' }),
+    commentList.createIndex({ authorId: 1 }, { name: 'authorId' })
   ]);
 };
 
@@ -37,6 +41,10 @@ export const backfillRecipeDefaults = async () => {
   await recipeList.updateMany(
     { likeCount: { $exists: false } },
     { $set: { likeCount: 0 } }
+  );
+  await recipeList.updateMany(
+    { commentCount: { $exists: false } },
+    { $set: { commentCount: 0 } }
   );
   const missingCreatedAt = await recipeList
     .find({ createdAt: { $exists: false } }, { projection: { _id: 1 } })

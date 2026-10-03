@@ -7,7 +7,8 @@ import {
   recipes as recipeCollection,
   users as userCollection,
   likes as likeCollection,
-  favorites as favoriteCollection
+  favorites as favoriteCollection,
+  comments as commentCollection
 } from './config/mongoCollections.js';
 
 //Pulls profile fields out of the access token.
@@ -194,8 +195,46 @@ const serializeRecipe = (recipe) => ({
   createdAt: recipe.createdAt ?? null,
   author: recipe.author ?? null,
   likedByMe: recipe.likedByMe ?? false,
-  favoritedByMe: recipe.favoritedByMe ?? false
+  favoritedByMe: recipe.favoritedByMe ?? false,
+  commentCount: recipe.commentCount ?? 0
 });
+
+//A comment as the API returns it. canDelete is decided for the viewer here
+//so the client never has to re-derive the rule: the comment's author, the
+//recipe's author, or an admin.
+const canDeleteComment = (viewer, comment, recipe) =>
+  Boolean(viewer) && (
+    isAdmin(viewer) ||
+    comment.authorId.equals(viewer._id) ||
+    (recipe.authorId != null && recipe.authorId.equals(viewer._id))
+  );
+
+const serializeComment = (comment, author, viewer, recipe) => ({
+  _id: comment._id.toString(),
+  body: comment.body,
+  createdAt: comment.createdAt,
+  author,
+  canDelete: canDeleteComment(viewer, comment, recipe)
+});
+
+//The thread for one recipe, oldest first, authors joined in one query.
+const commentsForRecipe = async (recipe, viewer) => {
+  const commentList = await commentCollection();
+  const docs = await commentList
+    .find({ recipeId: recipe._id })
+    .sort({ createdAt: 1, _id: 1 })
+    .toArray();
+  if(docs.length === 0) return [];
+  const userList = await userCollection();
+  const authors = await userList
+    .find({ _id: { $in: docs.map((c) => c.authorId) } })
+    .project({ username: 1, avatar: 1 })
+    .toArray();
+  const byId = new Map(authors.map((u) => [u._id.toString(), toAuthor(u)]));
+  return docs.map((c) =>
+    serializeComment(c, byId.get(c.authorId.toString()) ?? null, viewer, recipe)
+  );
+};
 
 //Raw documents -> API shape, with authors joined and the viewer's flags set.
 const present = async (recipeDocs, viewer) =>
@@ -325,6 +364,16 @@ export const resolvers = {
     },
   },
 
+  //Resolved only when a query asks for it, so list queries never pay for
+  //threads. The parent is the serialized recipe (string _id, raw authorId).
+  Recipe: {
+    comments: async (recipe, _, context) =>
+      commentsForRecipe(
+        { ...recipe, _id: new ObjectId(recipe._id) },
+        await findViewer(context)
+      ),
+  },
+
   //Profile tabs. The parent is the serialized `me` object, so _id comes back
   //as a string and is rebuilt into an ObjectId for the lookups.
   User: {
@@ -356,6 +405,7 @@ export const resolvers = {
         ...recipe,
         authorId: user._id,
         likeCount: 0,
+        commentCount: 0,
         createdAt: new Date().toISOString()
       };
       const inserted = await retryOnSlugCollision(recipe, async (slug) => {
@@ -408,13 +458,65 @@ export const resolvers = {
       const { recipe, recipeList } = await requireManageable(context, _id);
       const result = await recipeList.deleteOne({ _id: recipe._id });
       if(result.deletedCount === 0) throw notFound();
-      //Reaction rows for a vanished recipe would only ever be skipped; drop
-      //them so the profile tabs never pay for loading them.
-      const [likeList, favoriteList] = await Promise.all([likeCollection(), favoriteCollection()]);
+      //Reaction rows and comments for a vanished recipe would only ever be
+      //skipped; drop them so the profile tabs never pay for loading them.
+      const [likeList, favoriteList, commentList] = await Promise.all([
+        likeCollection(), favoriteCollection(), commentCollection()
+      ]);
       await Promise.all([
         likeList.deleteMany({ recipeId: recipe._id }),
-        favoriteList.deleteMany({ recipeId: recipe._id })
+        favoriteList.deleteMany({ recipeId: recipe._id }),
+        commentList.deleteMany({ recipeId: recipe._id })
       ]);
+      return true;
+    },
+
+    addComment: async (_, { recipeId, body }, context) => {
+      const user = await requireAccount(context);
+      const text = helpers.validateCommentBody(body);
+      const objectId = helpers.validateId(recipeId);
+      const recipeList = await recipeCollection();
+      const recipe = await recipeList.findOne({ _id: objectId }, { projection: { authorId: 1 } });
+      if(!recipe) throw notFound();
+
+      const commentList = await commentCollection();
+      const doc = {
+        recipeId: objectId,
+        authorId: user._id,
+        body: text,
+        createdAt: new Date().toISOString()
+      };
+      const insertInfo = await commentList.insertOne(doc);
+      //The counter feeds the cards; the thread itself is read from the rows.
+      await recipeList.updateOne({ _id: objectId }, { $inc: { commentCount: 1 } });
+      return serializeComment({ ...doc, _id: insertInfo.insertedId }, toAuthor(user), user, recipe);
+    },
+
+    deleteComment: async (_, { _id }, context) => {
+      const user = await requireAccount(context);
+      const objectId = helpers.validateId(_id);
+      const commentList = await commentCollection();
+      const comment = await commentList.findOne({ _id: objectId });
+      if(!comment){
+        throw new GraphQLError('Comment Not Found', { extensions: {code: 'NOT_FOUND'} });
+      }
+      const recipeList = await recipeCollection();
+      //A recipe deleted out from under the comment leaves no owner to check;
+      //the comment is then orphaned and anyone who could see it may remove it.
+      const recipe = (await recipeList.findOne({ _id: comment.recipeId }, { projection: { authorId: 1 } }))
+        ?? { authorId: null };
+      if(!canDeleteComment(user, comment, recipe)){
+        throw new GraphQLError("You can only delete your own comments, or comments on your recipes.", {
+          extensions: { code: "FORBIDDEN" }
+        });
+      }
+      const result = await commentList.deleteOne({ _id: objectId });
+      if(result.deletedCount === 1){
+        await recipeList.updateOne(
+          { _id: comment.recipeId, commentCount: { $gt: 0 } },
+          { $inc: { commentCount: -1 } }
+        );
+      }
       return true;
     },
 

@@ -69,7 +69,14 @@ site's own, most liked first.
   Recipe carries `likedByMe` / `favoritedByMe` for the caller (false when
   anonymous), and `me { recipes likedRecipes favoriteRecipes }` feeds the
   profile tabs. Deleting a recipe removes its reaction rows.
-* Comments are next, as a `comments` collection keyed the same way.
+* Comments live in a `comments` collection (`recipeId`, `authorId`, `body`,
+  `createdAt`) and are only read through `Recipe.comments`, oldest first, so
+  list queries never load threads. `recipes.commentCount` is the counter the
+  cards show. `addComment` needs a signed-in user and a trimmed body of 1 to
+  1000 characters; `deleteComment` is allowed for the comment's author, the
+  recipe's author (so posters can moderate their own threads), or an admin.
+  Each Comment carries `canDelete` for the caller. Deleting a recipe removes
+  its comments.
 
 ### Notes
 * Any user created before this fix was stored without `email`/`username` (the
