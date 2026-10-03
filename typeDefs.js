@@ -32,6 +32,9 @@ export const typeDefs = `#graphql
     author: Author
     likeCount: Int!
     createdAt: String
+    # The viewer's own reactions. Always false when not signed in.
+    likedByMe: Boolean!
+    favoritedByMe: Boolean!
   }
 
   # The public face of a user, safe to show on anyone's recipe. User (below)
@@ -50,6 +53,10 @@ export const typeDefs = `#graphql
     avatar: String
     createdAt: String!
     role: String!
+    # The profile tabs. Only reachable through \`me\`, so always the caller's own.
+    recipes: [Recipe!]!
+    likedRecipes: [Recipe!]!
+    favoriteRecipes: [Recipe!]!
   }
 
   type Ingredient {
@@ -88,10 +95,17 @@ export const typeDefs = `#graphql
 
   # createRecipe and createImageUploadSignature need a signed-in user.
   # updateRecipe and deleteRecipe need the recipe's author or an admin.
+  # The like and favorite mutations need a signed-in user, are idempotent
+  # (liking twice is one like), and return the recipe with fresh counts and
+  # viewer flags so the client cache updates in place.
   type Mutation {
     createRecipe(input: RecipeInput!): Recipe!
     createImageUploadSignature: ImageUploadSignature!
     updateRecipe(_id: String!, input: RecipeInput!): Recipe!
     deleteRecipe(_id: String!): Boolean!
+    likeRecipe(_id: String!): Recipe!
+    unlikeRecipe(_id: String!): Recipe!
+    favoriteRecipe(_id: String!): Recipe!
+    unfavoriteRecipe(_id: String!): Recipe!
   }
 `;

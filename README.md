@@ -62,9 +62,14 @@ site's own, most liked first.
   `FORBIDDEN`. Edits cannot change `authorId`, `likeCount` or `createdAt`.
 * Two people can post the same title: on a slug collision the second one gets
   a short random suffix (`garlic-bread-3f9a1c`) instead of an error.
-* Likes, saves and comments are coming next as their own collections keyed by
-  `(recipeId, userId)`; `likeCount` on the recipe is the denormalised counter
-  the list sorts on.
+* Likes and favorites are their own collections (`likes`, `favorites`), one
+  row per `(recipeId, userId)` under a unique index, so `likeRecipe` and
+  friends are idempotent. Liking also `$inc`s `recipes.likeCount`, the
+  denormalised counter the list sorts on; favorites keep no counter. Every
+  Recipe carries `likedByMe` / `favoritedByMe` for the caller (false when
+  anonymous), and `me { recipes likedRecipes favoriteRecipes }` feeds the
+  profile tabs. Deleting a recipe removes its reaction rows.
+* Comments are next, as a `comments` collection keyed the same way.
 
 ### Notes
 * Any user created before this fix was stored without `email`/`username` (the

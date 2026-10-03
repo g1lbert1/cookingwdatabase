@@ -1,9 +1,14 @@
 import { createHash, randomBytes } from 'node:crypto';
 import { GraphQLError } from 'graphql';
+import { ObjectId } from 'mongodb';
 import helpers from './helpers.js';
 import { authConfig, cloudinaryConfig } from './config/settings.js';
-import { recipes as recipeCollection } from './config/mongoCollections.js';
-import { users as userCollection } from './config/mongoCollections.js';
+import {
+  recipes as recipeCollection,
+  users as userCollection,
+  likes as likeCollection,
+  favorites as favoriteCollection
+} from './config/mongoCollections.js';
 
 //Pulls profile fields out of the access token.
 //These only exist if an Auth0 Action adds them as namespaced custom claims --
@@ -44,6 +49,9 @@ const isConfiguredAdmin = (profile) =>
   Boolean(authConfig.adminEmail) &&
   profile.emailVerified &&
   profile.email === authConfig.adminEmail;
+
+const notFound = () =>
+  new GraphQLError('Recipe Not Found', { extensions: {code: 'NOT_FOUND'} });
 
 const requireUser = (context) => {
   if(!context.user){
@@ -102,6 +110,15 @@ const requireAccount = async (context) => {
   return currentUser;
 };
 
+//The signed-in viewer for read-only decoration (likedByMe and friends).
+//Unlike requireAccount it never creates or repairs anything: a viewer with
+//no account yet has no reactions, and anonymous readers get null.
+const findViewer = async (context) => {
+  if(!context.user) return null;
+  const userList = await userCollection();
+  return userList.findOne({ auth0Id: context.user.sub });
+};
+
 const isAdmin = (user) => user?.role === "admin";
 
 //Authors manage their own recipes; admins manage everything. Recipes from
@@ -114,11 +131,7 @@ const requireManageable = async (context, _id) => {
   const objectId = helpers.validateId(_id);
   const recipeList = await recipeCollection();
   const recipe = await recipeList.findOne({ _id: objectId });
-  if(!recipe){
-    throw new GraphQLError('Recipe Not Found', {
-      extensions: {code: 'NOT_FOUND'}
-    });
-  }
+  if(!recipe) throw notFound();
   if(!canManage(user, recipe)){
     throw new GraphQLError("You can only change recipes you posted.", {
       extensions: { code: "FORBIDDEN" }
@@ -151,13 +164,92 @@ const attachAuthors = async (recipeDocs) => {
   }));
 };
 
+//Sets likedByMe / favoritedByMe for the viewer with one query per reaction
+//type, however many recipes are in the batch.
+const markForViewer = async (recipeDocs, viewer) => {
+  if(!viewer || recipeDocs.length === 0){
+    return recipeDocs.map((r) => ({ ...r, likedByMe: false, favoritedByMe: false }));
+  }
+  const ids = recipeDocs.map((r) => r._id);
+  const rowsFor = async (collection) => {
+    const rows = await collection();
+    const found = await rows
+      .find({ userId: viewer._id, recipeId: { $in: ids } })
+      .project({ recipeId: 1 })
+      .toArray();
+    return new Set(found.map((row) => row.recipeId.toString()));
+  };
+  const [liked, favorited] = await Promise.all([rowsFor(likeCollection), rowsFor(favoriteCollection)]);
+  return recipeDocs.map((r) => ({
+    ...r,
+    likedByMe: liked.has(r._id.toString()),
+    favoritedByMe: favorited.has(r._id.toString())
+  }));
+};
+
 const serializeRecipe = (recipe) => ({
   ...recipe,
   _id: recipe._id.toString(),
   likeCount: recipe.likeCount ?? 0,
   createdAt: recipe.createdAt ?? null,
-  author: recipe.author ?? null
+  author: recipe.author ?? null,
+  likedByMe: recipe.likedByMe ?? false,
+  favoritedByMe: recipe.favoritedByMe ?? false
 });
+
+//Raw documents -> API shape, with authors joined and the viewer's flags set.
+const present = async (recipeDocs, viewer) =>
+  (await markForViewer(await attachAuthors(recipeDocs), viewer)).map(serializeRecipe);
+
+//Likes and favorites share one shape: a (recipeId, userId) row guarded by a
+//unique index, so a repeated like inserts nothing and the mutation is safe to
+//retry. Likes also move recipes.likeCount, which the list sorts on; the
+//`changed` flag keeps the counter honest when nothing was inserted or removed.
+const setReaction = async (context, _id, { collection, on, counter = null }) => {
+  const user = await requireAccount(context);
+  const objectId = helpers.validateId(_id);
+  const recipeList = await recipeCollection();
+  if(!(await recipeList.findOne({ _id: objectId }, { projection: { _id: 1 } }))) throw notFound();
+
+  const rows = await collection();
+  let changed = false;
+  if(on){
+    try {
+      await rows.insertOne({ recipeId: objectId, userId: user._id, createdAt: new Date().toISOString() });
+      changed = true;
+    } catch (e) {
+      if(e?.code !== 11000) throw e;
+    }
+  } else {
+    const result = await rows.deleteOne({ recipeId: objectId, userId: user._id });
+    changed = result.deletedCount === 1;
+  }
+  if(changed && counter){
+    await recipeList.updateOne({ _id: objectId }, { $inc: { [counter]: on ? 1 : -1 } });
+  }
+
+  const recipe = await recipeList.findOne({ _id: objectId });
+  if(!recipe) throw notFound();
+  const [presented] = await present([recipe], user);
+  return presented;
+};
+
+//The recipes behind a user's reaction rows, most recently reacted first.
+const reactedRecipes = async (collection, user) => {
+  const rows = await collection();
+  const reactions = await rows
+    .find({ userId: user._id })
+    .sort({ createdAt: -1, _id: -1 })
+    .project({ recipeId: 1 })
+    .toArray();
+  if(reactions.length === 0) return [];
+  const recipeList = await recipeCollection();
+  const docs = await recipeList.find({ _id: { $in: reactions.map((r) => r.recipeId) } }).toArray();
+  const byId = new Map(docs.map((d) => [d._id.toString(), d]));
+  //Keep the reaction order; a recipe deleted in the meantime just drops out.
+  const ordered = reactions.map((r) => byId.get(r.recipeId.toString())).filter(Boolean);
+  return present(ordered, user);
+};
 
 //Mongo raises E11000 when a write violates the unique slug index. With many
 //people posting, two recipes called "Carbonara" are expected rather than a
@@ -204,28 +296,23 @@ export const resolvers = {
   Query: {
     //Most liked first. createdAt breaks ties so new posts surface above older
     //ones at the same count, and _id makes the order stable across pages.
-    recipes: async () => {
+    recipes: async (_, __, context) => {
       const recipeList = await recipeCollection();
       const allRecipes = await recipeList
         .find({})
         .sort({ likeCount: -1, createdAt: -1, _id: -1 })
         .toArray();
-      return (await attachAuthors(allRecipes)).map(serializeRecipe);
+      return present(allRecipes, await findViewer(context));
     },
 
-    getRecipeBySlug: async (_, args) => {
+    getRecipeBySlug: async (_, args, context) => {
       //validate Input
       const slug = helpers.validateSlug(args.slug);
       const recipeList = await recipeCollection();
       const foundRecipe = await recipeList.findOne({ slug: slug });
-      if(!foundRecipe){
-        //cant find recipe based on given slug
-        throw new GraphQLError('Recipe Not Found', {
-          extensions: {code: 'NOT_FOUND'}
-        });
-      }
-      const [withAuthor] = await attachAuthors([foundRecipe]);
-      return serializeRecipe(withAuthor);
+      if(!foundRecipe) throw notFound();
+      const [presented] = await present([foundRecipe], await findViewer(context));
+      return presented;
     },
 
     me: async (_, __, context) => {
@@ -236,6 +323,24 @@ export const resolvers = {
         avatar: currentUser.avatar ?? null
       };
     },
+  },
+
+  //Profile tabs. The parent is the serialized `me` object, so _id comes back
+  //as a string and is rebuilt into an ObjectId for the lookups.
+  User: {
+    recipes: async (user) => {
+      const recipeList = await recipeCollection();
+      const owner = { ...user, _id: new ObjectId(user._id) };
+      const docs = await recipeList
+        .find({ authorId: owner._id })
+        .sort({ createdAt: -1, _id: -1 })
+        .toArray();
+      return present(docs, owner);
+    },
+    likedRecipes: (user) =>
+      reactedRecipes(likeCollection, { ...user, _id: new ObjectId(user._id) }),
+    favoriteRecipes: (user) =>
+      reactedRecipes(favoriteCollection, { ...user, _id: new ObjectId(user._id) }),
   },
 
   Mutation: {
@@ -261,7 +366,7 @@ export const resolvers = {
     },
 
     updateRecipe: async (_, { _id, input }, context) => {
-      const { recipe: existing, recipeList } = await requireManageable(context, _id);
+      const { user, recipe: existing, recipeList } = await requireManageable(context, _id);
 
       const recipe = helpers.validateRecipeInput(input);
       //Only the editable fields. authorId, likeCount and createdAt belong to
@@ -273,13 +378,9 @@ export const resolvers = {
           { returnDocument: 'after' }
         )
       );
-      if(!updated){
-        throw new GraphQLError('Recipe Not Found', {
-          extensions: {code: 'NOT_FOUND'}
-        });
-      }
-      const [withAuthor] = await attachAuthors([updated]);
-      return serializeRecipe(withAuthor);
+      if(!updated) throw notFound();
+      const [presented] = await present([updated], user);
+      return presented;
     },
 
     //Anyone signed in may upload a photo for their recipe. The secret still
@@ -306,12 +407,24 @@ export const resolvers = {
     deleteRecipe: async (_, { _id }, context) => {
       const { recipe, recipeList } = await requireManageable(context, _id);
       const result = await recipeList.deleteOne({ _id: recipe._id });
-      if(result.deletedCount === 0){
-        throw new GraphQLError('Recipe Not Found', {
-          extensions: {code: 'NOT_FOUND'}
-        });
-      }
+      if(result.deletedCount === 0) throw notFound();
+      //Reaction rows for a vanished recipe would only ever be skipped; drop
+      //them so the profile tabs never pay for loading them.
+      const [likeList, favoriteList] = await Promise.all([likeCollection(), favoriteCollection()]);
+      await Promise.all([
+        likeList.deleteMany({ recipeId: recipe._id }),
+        favoriteList.deleteMany({ recipeId: recipe._id })
+      ]);
       return true;
     },
+
+    likeRecipe: (_, { _id }, context) =>
+      setReaction(context, _id, { collection: likeCollection, on: true, counter: 'likeCount' }),
+    unlikeRecipe: (_, { _id }, context) =>
+      setReaction(context, _id, { collection: likeCollection, on: false, counter: 'likeCount' }),
+    favoriteRecipe: (_, { _id }, context) =>
+      setReaction(context, _id, { collection: favoriteCollection, on: true }),
+    unfavoriteRecipe: (_, { _id }, context) =>
+      setReaction(context, _id, { collection: favoriteCollection, on: false }),
   }
 }
