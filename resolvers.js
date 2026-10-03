@@ -1,4 +1,4 @@
-import { createHash } from 'node:crypto';
+import { createHash, randomBytes } from 'node:crypto';
 import { GraphQLError } from 'graphql';
 import helpers from './helpers.js';
 import { authConfig, cloudinaryConfig } from './config/settings.js';
@@ -54,32 +54,140 @@ const requireUser = (context) => {
   return context.user;
 };
 
-const requireAdmin = async (context) => {
+//Resolves the token to a user document, creating it on first login and
+//repairing or promoting it as needed. Every mutation that writes on behalf
+//of a user goes through here, so a brand-new account can post a recipe
+//without having loaded the profile page first.
+const requireAccount = async (context) => {
   const claims = requireUser(context);
   const userList = await userCollection();
-  const currentUser = await userList.findOne({ auth0Id: claims.sub });
-  if(currentUser?.role !== "admin"){
-    throw new GraphQLError("Unauthorized", {
+  let currentUser = await userList.findOne({ auth0Id: claims.sub });
+  const profile = profileFromClaims(claims);
+
+  if(!currentUser){
+    requireProfile(profile);
+    const newUser = {
+      auth0Id: claims.sub,
+      email: profile.email,
+      username: profile.username,
+      avatar: profile.avatar,
+      createdAt: new Date().toISOString(),
+      role: isConfiguredAdmin(profile) ? "admin" : "user"
+    };
+    const insertInfo = await userList.insertOne(newUser);
+    currentUser = await userList.findOne({ _id: insertInfo.insertedId });
+  } else if(!currentUser.email || !currentUser.username){
+    //Repairs records written before the claims were validated, which the
+    //mongo driver stored with the undefined fields dropped entirely.
+    requireProfile(profile);
+    await userList.updateOne(
+      { _id: currentUser._id },
+      { $set: {
+        email: profile.email,
+        username: profile.username,
+        avatar: currentUser.avatar ?? profile.avatar
+      } }
+    );
+    currentUser = await userList.findOne({ _id: currentUser._id });
+  }
+
+  //Re-check on every login rather than only at creation. Otherwise an
+  //account created before ADMIN_EMAIL was set (or against a fresh
+  //database) is stuck as "user" until someone edits Mongo by hand.
+  if(currentUser.role !== "admin" && isConfiguredAdmin(profile)){
+    await userList.updateOne({ _id: currentUser._id }, { $set: { role: "admin" } });
+    currentUser = { ...currentUser, role: "admin" };
+  }
+
+  return currentUser;
+};
+
+const isAdmin = (user) => user?.role === "admin";
+
+//Authors manage their own recipes; admins manage everything. Recipes from
+//before sharing existed have no authorId and are admin-only.
+const canManage = (user, recipe) =>
+  isAdmin(user) || (recipe.authorId != null && recipe.authorId.equals(user._id));
+
+const requireManageable = async (context, _id) => {
+  const user = await requireAccount(context);
+  const objectId = helpers.validateId(_id);
+  const recipeList = await recipeCollection();
+  const recipe = await recipeList.findOne({ _id: objectId });
+  if(!recipe){
+    throw new GraphQLError('Recipe Not Found', {
+      extensions: {code: 'NOT_FOUND'}
+    });
+  }
+  if(!canManage(user, recipe)){
+    throw new GraphQLError("You can only change recipes you posted.", {
       extensions: { code: "FORBIDDEN" }
     });
   }
-  return currentUser;
+  return { user, recipe, recipeList };
+};
+
+//Only the public fields. The User type carries the email and is reserved
+//for `me`.
+const toAuthor = (user) =>
+  user
+    ? { _id: user._id.toString(), username: user.username, avatar: user.avatar ?? null }
+    : null;
+
+//Attaches `author` to each recipe with one users query instead of one per
+//recipe. Recipes without an authorId get null.
+const attachAuthors = async (recipeDocs) => {
+  const authorIds = recipeDocs.filter((r) => r.authorId).map((r) => r.authorId);
+  if(authorIds.length === 0) return recipeDocs.map((r) => ({ ...r, author: null }));
+  const userList = await userCollection();
+  const authors = await userList
+    .find({ _id: { $in: authorIds } })
+    .project({ username: 1, avatar: 1 })
+    .toArray();
+  const byId = new Map(authors.map((u) => [u._id.toString(), toAuthor(u)]));
+  return recipeDocs.map((r) => ({
+    ...r,
+    author: r.authorId ? byId.get(r.authorId.toString()) ?? null : null
+  }));
 };
 
 const serializeRecipe = (recipe) => ({
   ...recipe,
-  _id: recipe._id.toString()
+  _id: recipe._id.toString(),
+  likeCount: recipe.likeCount ?? 0,
+  createdAt: recipe.createdAt ?? null,
+  author: recipe.author ?? null
 });
 
-//Mongo raises E11000 when a write violates the unique slug index. Two recipes
-//with the same title would otherwise be indistinguishable by URL.
+//Mongo raises E11000 when a write violates the unique slug index. With many
+//people posting, two recipes called "Carbonara" are expected rather than a
+//mistake, so the second one gets a short random suffix on its slug instead
+//of an error.
 const isDuplicateKey = (e) => e?.code === 11000;
+const SLUG_ATTEMPTS = 4;
+const withSlugSuffix = (slug) => `${slug}-${randomBytes(3).toString('hex')}`;
 const duplicateTitleError = (title) =>
   new GraphQLError(`A recipe titled "${title}" already exists. Choose a different title.`, {
     extensions: {code: 'BAD_USER_INPUT'}
   });
 
-//Cloudinary's signed-upload scheme: sort the params to sign alphabetically,
+//Runs `write(slug)` with the plain slug first, then with suffixed slugs on
+//collision. Gives up with the duplicate-title error only if every attempt
+//collides, which would take a remarkable run of bad luck.
+const retryOnSlugCollision = async (recipe, write) => {
+  let slug = recipe.slug;
+  for(let attempt = 0; attempt < SLUG_ATTEMPTS; attempt++){
+    try {
+      return await write(slug);
+    } catch (e) {
+      if(!isDuplicateKey(e)) throw e;
+      slug = withSlugSuffix(recipe.slug);
+    }
+  }
+  throw duplicateTitleError(recipe.title);
+};
+
+//Cloudinary signed-upload scheme: sort the params to sign alphabetically,
 //join as key=value&..., append the API secret, SHA-1 the result. The browser
 //sends the same params plus the signature; Cloudinary recomputes and compares.
 //https://cloudinary.com/documentation/upload_images#generating_authentication_signatures
@@ -94,10 +202,15 @@ const signUploadParams = (params, secret) => {
 export const resolvers = {
   //Query Resolver
   Query: {
+    //Most liked first. createdAt breaks ties so new posts surface above older
+    //ones at the same count, and _id makes the order stable across pages.
     recipes: async () => {
       const recipeList = await recipeCollection();
-      const allRecipes = await recipeList.find({}).toArray();
-      return allRecipes.map(serializeRecipe);
+      const allRecipes = await recipeList
+        .find({})
+        .sort({ likeCount: -1, createdAt: -1, _id: -1 })
+        .toArray();
+      return (await attachAuthors(allRecipes)).map(serializeRecipe);
     },
 
     getRecipeBySlug: async (_, args) => {
@@ -111,52 +224,12 @@ export const resolvers = {
           extensions: {code: 'NOT_FOUND'}
         });
       }
-      return serializeRecipe(foundRecipe);
+      const [withAuthor] = await attachAuthors([foundRecipe]);
+      return serializeRecipe(withAuthor);
     },
 
     me: async (_, __, context) => {
-      //check if user is logged in
-      const claims = requireUser(context);
-
-      const userList = await userCollection();
-      let currentUser = await userList.findOne({ auth0Id: claims.sub });
-      const profile = profileFromClaims(claims);
-
-      if(!currentUser){
-        requireProfile(profile);
-        const newUser = {
-          auth0Id: claims.sub,
-          email: profile.email,
-          username: profile.username,
-          avatar: profile.avatar,
-          createdAt: new Date().toISOString(),
-          role: isConfiguredAdmin(profile) ? "admin" : "user"
-        };
-        const insertInfo = await userList.insertOne(newUser);
-        currentUser = await userList.findOne({ _id: insertInfo.insertedId });
-      } else if(!currentUser.email || !currentUser.username){
-        //Repairs records written before the claims were validated, which the
-        //mongo driver stored with the undefined fields dropped entirely.
-        requireProfile(profile);
-        await userList.updateOne(
-          { _id: currentUser._id },
-          { $set: {
-            email: profile.email,
-            username: profile.username,
-            avatar: currentUser.avatar ?? profile.avatar
-          } }
-        );
-        currentUser = await userList.findOne({ _id: currentUser._id });
-      }
-
-      //Re-check on every login rather than only at creation. Otherwise an
-      //account created before ADMIN_EMAIL was set (or against a fresh
-      //database) is stuck as "user" until someone edits Mongo by hand.
-      if(currentUser.role !== "admin" && isConfiguredAdmin(profile)){
-        await userList.updateOne({ _id: currentUser._id }, { $set: { role: "admin" } });
-        currentUser = { ...currentUser, role: "admin" };
-      }
-
+      const currentUser = await requireAccount(context);
       return {
         ...currentUser,
         _id: currentUser._id.toString(),
@@ -166,51 +239,53 @@ export const resolvers = {
   },
 
   Mutation: {
+    //Any signed-in user can post. The recipe is stamped with their account id
+    //so the list can show who shared it and so only they (or an admin) can
+    //change it later.
     createRecipe: async (_, { input }, context) => {
-      await requireAdmin(context);
+      const user = await requireAccount(context);
 
       const recipe = helpers.validateRecipeInput(input);
       const recipeList = await recipeCollection();
-      let insertInfo;
-      try {
-        insertInfo = await recipeList.insertOne(recipe);
-      } catch (e) {
-        if(isDuplicateKey(e)) throw duplicateTitleError(recipe.title);
-        throw e;
-      }
-      return {
+      const doc = {
         ...recipe,
-        _id: insertInfo.insertedId.toString()
+        authorId: user._id,
+        likeCount: 0,
+        createdAt: new Date().toISOString()
       };
+      const inserted = await retryOnSlugCollision(recipe, async (slug) => {
+        const insertInfo = await recipeList.insertOne({ ...doc, slug });
+        return { ...doc, slug, _id: insertInfo.insertedId };
+      });
+      return serializeRecipe({ ...inserted, author: toAuthor(user) });
     },
 
     updateRecipe: async (_, { _id, input }, context) => {
-      await requireAdmin(context);
+      const { recipe: existing, recipeList } = await requireManageable(context, _id);
 
-      const objectId = helpers.validateId(_id);
       const recipe = helpers.validateRecipeInput(input);
-      const recipeList = await recipeCollection();
-      let updated;
-      try {
-        updated = await recipeList.findOneAndUpdate(
-          { _id: objectId },
-          { $set: recipe },
+      //Only the editable fields. authorId, likeCount and createdAt belong to
+      //the system and must survive an edit untouched.
+      const updated = await retryOnSlugCollision(recipe, (slug) =>
+        recipeList.findOneAndUpdate(
+          { _id: existing._id },
+          { $set: { ...recipe, slug } },
           { returnDocument: 'after' }
-        );
-      } catch (e) {
-        if(isDuplicateKey(e)) throw duplicateTitleError(recipe.title);
-        throw e;
-      }
+        )
+      );
       if(!updated){
         throw new GraphQLError('Recipe Not Found', {
           extensions: {code: 'NOT_FOUND'}
         });
       }
-      return serializeRecipe(updated);
+      const [withAuthor] = await attachAuthors([updated]);
+      return serializeRecipe(withAuthor);
     },
 
+    //Anyone signed in may upload a photo for their recipe. The secret still
+    //never leaves the server; the rate limiter bounds abuse.
     createImageUploadSignature: async (_, __, context) => {
-      await requireAdmin(context);
+      await requireAccount(context);
 
       if(!cloudinaryConfig){
         throw new GraphQLError('Photo uploads are not configured on this server.', {
@@ -229,11 +304,8 @@ export const resolvers = {
     },
 
     deleteRecipe: async (_, { _id }, context) => {
-      await requireAdmin(context);
-
-      const objectId = helpers.validateId(_id);
-      const recipeList = await recipeCollection();
-      const result = await recipeList.deleteOne({ _id: objectId });
+      const { recipe, recipeList } = await requireManageable(context, _id);
+      const result = await recipeList.deleteOne({ _id: recipe._id });
       if(result.deletedCount === 0){
         throw new GraphQLError('Recipe Not Found', {
           extensions: {code: 'NOT_FOUND'}

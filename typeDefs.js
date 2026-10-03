@@ -12,6 +12,7 @@ export const typeDefs = `#graphql
   }
 
   type Query {
+    # Every recipe, most liked first; ties fall back to newest first.
     recipes: [Recipe!]!
     getRecipeBySlug(slug: String!): Recipe 
     me: User
@@ -26,6 +27,19 @@ export const typeDefs = `#graphql
     prepTime: Int!
     content: String
     imageUrl: String
+    # Who posted it. Null for the site's own recipes (created before sharing
+    # existed, or by an admin without an account record).
+    author: Author
+    likeCount: Int!
+    createdAt: String
+  }
+
+  # The public face of a user, safe to show on anyone's recipe. User (below)
+  # includes the email and is only ever returned for the caller themself.
+  type Author {
+    _id: String!
+    username: String!
+    avatar: String
   }
 
   type User {
@@ -72,6 +86,8 @@ export const typeDefs = `#graphql
     folder: String!
   }
 
+  # createRecipe and createImageUploadSignature need a signed-in user.
+  # updateRecipe and deleteRecipe need the recipe's author or an admin.
   type Mutation {
     createRecipe(input: RecipeInput!): Recipe!
     createImageUploadSignature: ImageUploadSignature!

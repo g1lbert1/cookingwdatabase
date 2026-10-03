@@ -47,6 +47,25 @@ Then drag it into the Login flow and hit Apply. Until it is live, `me` returns a
 clear `BAD_USER_INPUT` naming the missing claims instead of writing a broken
 user document.
 
+### Sharing (branch `sharing`)
+Any signed-in user can post recipes; they appear in the same list as the
+site's own, most liked first.
+
+* `recipes` sorts by `likeCount` desc, then `createdAt` desc. Both fields are
+  set on insert and backfilled at startup for older documents
+  (`backfillRecipeDefaults`), so nothing sinks to the bottom for lacking them.
+* Each recipe stores `authorId` (the poster's `users._id`). The API exposes it
+  as `author { _id username avatar }`, never the email. Recipes with no
+  `authorId` are the site's own and show `author: null`.
+* `createRecipe` and `createImageUploadSignature` need any signed-in user.
+  `updateRecipe` and `deleteRecipe` need the author or an admin, otherwise
+  `FORBIDDEN`. Edits cannot change `authorId`, `likeCount` or `createdAt`.
+* Two people can post the same title: on a slug collision the second one gets
+  a short random suffix (`garlic-bread-3f9a1c`) instead of an error.
+* Likes, saves and comments are coming next as their own collections keyed by
+  `(recipeId, userId)`; `likeCount` on the recipe is the denormalised counter
+  the list sorts on.
+
 ### Notes
 * Any user created before this fix was stored without `email`/`username` (the
   mongo driver drops `undefined` keys), which made `me` fail forever for them.

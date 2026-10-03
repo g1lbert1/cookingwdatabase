@@ -11,7 +11,7 @@ import jwksClient from 'jwks-rsa';
 import { typeDefs } from './typeDefs.js';
 import { resolvers } from './resolvers.js';
 import { authConfig, serverConfig, isProduction } from './config/settings.js';
-import { ensureIndexes } from './config/indexes.js';
+import { ensureIndexes, backfillRecipeDefaults } from './config/indexes.js';
 
 const client = jwksClient({
   jwksUri: authConfig.jwksUri
@@ -59,6 +59,7 @@ const buildContext = async ({ req }) => {
 // Fail fast if Mongo is unreachable or the unique indexes conflict with
 // existing data, instead of discovering it on the first request.
 await ensureIndexes();
+await backfillRecipeDefaults();
 
 const app = express();
 // Hosts like Render and Railway terminate TLS at a proxy and forward the real
