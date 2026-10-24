@@ -1,7 +1,7 @@
 import { randomBytes } from 'node:crypto';
 import { GraphQLError } from 'graphql';
 import { ObjectId } from 'mongodb';
-import helpers from './helpers.js';
+import helpers, { DEFAULT_LAYOUT, DEFAULT_ACCENT } from './helpers.js';
 import { signParams, cloudinary } from './cloudinary.js';
 import { authConfig, cloudinaryConfig } from './config/settings.js';
 import {
@@ -313,8 +313,8 @@ const serializeRecipe = (recipe) => ({
   //Page settings. Recipes from before these existed read as the plain page.
   story: recipe.story ?? null,
   gallery: recipe.gallery ?? [],
-  layout: recipe.layout ?? helpers.DEFAULT_LAYOUT,
-  accent: recipe.accent ?? helpers.DEFAULT_ACCENT
+  layout: recipe.layout ?? DEFAULT_LAYOUT,
+  accent: recipe.accent ?? DEFAULT_ACCENT
 });
 
 //A comment as the API returns it. canDelete is decided for the viewer here
