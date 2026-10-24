@@ -11,7 +11,7 @@ import jwksClient from 'jwks-rsa';
 import { typeDefs } from './typeDefs.js';
 import { resolvers } from './resolvers.js';
 import { authConfig, serverConfig, cloudinaryConfig, orphanSweepConfig, isProduction } from './config/settings.js';
-import { ensureIndexes, backfillRecipeDefaults } from './config/indexes.js';
+import { ensureIndexes, backfillRecipeDefaults, backfillUsernames } from './config/indexes.js';
 import { scheduleOrphanSweep } from './orphanSweep.js';
 
 const client = jwksClient({
@@ -58,7 +58,9 @@ const buildContext = async ({ req }) => {
 };
 
 // Fail fast if Mongo is unreachable or the unique indexes conflict with
-// existing data, instead of discovering it on the first request.
+// existing data, instead of discovering it on the first request. Usernames
+// are keyed first so the unique index has something consistent to build on.
+await backfillUsernames();
 await ensureIndexes();
 await backfillRecipeDefaults();
 
