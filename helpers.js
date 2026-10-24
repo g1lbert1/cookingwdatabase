@@ -2,9 +2,19 @@ import { GraphQLError } from 'graphql';
 import { ObjectId } from 'mongodb';
 import slugify from 'slugify';
 import { publicIdFromUrl } from './cloudinary.js';
+import { assertClean } from './profanity.js';
 
 const badInput = (message) =>
   new GraphQLError(message, { extensions: { code: 'BAD_USER_INPUT' } });
+
+//The optional recipe page settings. The GraphQL enums already refuse other
+//values; these are the defaults and the guard for documents written by hand.
+export const RECIPE_LAYOUTS = ['CLASSIC', 'EDITORIAL', 'GALLERY'];
+export const RECIPE_ACCENTS = ['PLUM', 'VIOLET', 'BERRY', 'TEAL'];
+export const DEFAULT_LAYOUT = 'CLASSIC';
+export const DEFAULT_ACCENT = 'PLUM';
+const STORY_MAX = 20000;
+const GALLERY_MAX = 8;
 
 // Single slug algorithm for both writing and looking up. The old validateSlug
 // stripped non-word characters while createRecipe used slugify's
@@ -56,7 +66,7 @@ const exportedHelpers = {
   validateCommentBody (body) {
     const trimmed = requireNonEmptyString(body, 'Comment');
     if (trimmed.length > 1000) throw badInput('Comments must be 1000 characters or fewer.');
-    return trimmed;
+    return assertClean(trimmed, 'Your comment');
   },
 
   //Guards ObjectId construction, which throws a raw BSONError on bad input.
@@ -73,6 +83,7 @@ const exportedHelpers = {
   validateRecipeInput (input) {
     const title = requireNonEmptyString(input.title, 'Title');
     if (title.length > 200) throw badInput('Title must be 200 characters or fewer.');
+    assertClean(title, 'The title');
 
     const slug = makeSlug(title);
     if (!slug) throw badInput(`Title "${title}" contains no characters usable in a URL.`);
@@ -86,10 +97,12 @@ const exportedHelpers = {
     }
     const ingredients = input.ingredients.map((ing, i) => {
       const name = requireNonEmptyString(ing.name, `Ingredient ${i + 1} name`);
+      assertClean(name, `Ingredient ${i + 1}`);
       if (ing.amount != null && (typeof ing.amount !== 'number' || !Number.isFinite(ing.amount) || ing.amount < 0)) {
         throw badInput(`Ingredient "${name}" amount must be zero or greater.`);
       }
       const notes = typeof ing.notes === 'string' ? ing.notes.trim() : null;
+      if (notes) assertClean(notes, `Ingredient ${i + 1}'s notes`);
       return {
         name,
         amount: ing.amount ?? null,
@@ -102,11 +115,36 @@ const exportedHelpers = {
       throw badInput('A recipe needs at least one instruction step.');
     }
     const instructions = input.instructions.map((step, i) =>
-      requireNonEmptyString(step, `Instruction step ${i + 1}`)
+      assertClean(requireNonEmptyString(step, `Instruction step ${i + 1}`), `Step ${i + 1}`)
     );
 
     const content = typeof input.content === 'string' ? input.content.trim() : null;
+    if (content) assertClean(content, 'The description');
     const imageUrl = validateImageUrl(input.imageUrl);
+
+    //The optional page settings. Absent, null and empty all mean "plain".
+    if (input.story != null && typeof input.story !== 'string') throw badInput('story must be text.');
+    const story = input.story?.trim() || null;
+    if (story && story.length > STORY_MAX) {
+      throw badInput(`The story must be ${STORY_MAX.toLocaleString('en-US')} characters or fewer.`);
+    }
+    if (story) assertClean(story, 'The story');
+
+    if (input.gallery != null && !Array.isArray(input.gallery)) throw badInput('gallery must be a list of photo URLs.');
+    const gallery = [];
+    for (const url of input.gallery ?? []) {
+      const valid = validateImageUrl(url);
+      //A blank slot, a repeat, or the cover photo again adds nothing.
+      if (valid && valid !== imageUrl && !gallery.includes(valid)) gallery.push(valid);
+    }
+    if (gallery.length > GALLERY_MAX) {
+      throw badInput(`A recipe can have at most ${GALLERY_MAX} extra photos.`);
+    }
+
+    const layout = input.layout ?? DEFAULT_LAYOUT;
+    if (!RECIPE_LAYOUTS.includes(layout)) throw badInput(`Unknown layout "${layout}".`);
+    const accent = input.accent ?? DEFAULT_ACCENT;
+    if (!RECIPE_ACCENTS.includes(accent)) throw badInput(`Unknown accent "${accent}".`);
 
     return {
       title,
@@ -115,7 +153,11 @@ const exportedHelpers = {
       ingredients,
       instructions,
       content: content || null,
-      imageUrl
+      imageUrl,
+      story,
+      gallery,
+      layout,
+      accent
     };
   }
 };

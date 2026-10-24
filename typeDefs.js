@@ -11,13 +11,38 @@ export const typeDefs = `#graphql
     POUND
   }
 
+  # The page templates a recipe can be shown in. CLASSIC is the site's own
+  # layout and the default for every recipe that never chose one.
+  enum RecipeLayout {
+    CLASSIC
+    EDITORIAL
+    GALLERY
+  }
+
+  # Curated accent tones for the recipe page. Each is a dark surface that
+  # white text clears at 9:1 or better; PLUM is the site colour and default.
+  enum RecipeAccent {
+    PLUM
+    VIOLET
+    BERRY
+    TEAL
+  }
+
   type Query {
     # Every recipe, most liked first; ties fall back to newest first.
     recipes: [Recipe!]!
-    getRecipeBySlug(slug: String!): Recipe 
+    getRecipeBySlug(slug: String!): Recipe
     me: User
+    # Someone's public profile by username, matched case-insensitively. A
+    # username that was given up recently still resolves to its old owner so
+    # shared links keep working; the client redirects to the current name.
+    # Null when nobody has that name.
+    user(username: String!): PublicUser
+    # Live feedback for the rename form: is this name valid and free? Signed-in
+    # users only. The same rules run again inside updateUsername.
+    checkUsername(username: String!): UsernameCheck!
   }
-  
+
   type Recipe {
     _id: String!
     title: String!
@@ -27,6 +52,13 @@ export const typeDefs = `#graphql
     prepTime: Int!
     content: String
     imageUrl: String
+    # Optional long-form introduction in Markdown. Rendered by the client
+    # with raw HTML disabled; stored exactly as written.
+    story: String
+    # Extra photos beyond imageUrl, in display order. Empty for most recipes.
+    gallery: [String!]!
+    layout: RecipeLayout!
+    accent: RecipeAccent!
     # Who posted it. Null for the site's own recipes (created before sharing
     # existed, or by an admin without an account record).
     author: Author
@@ -71,6 +103,23 @@ export const typeDefs = `#graphql
     favoriteRecipes: [Recipe!]!
   }
 
+  # What anyone may see of a user: the Author fields plus their recipes.
+  # Likes and favorites are private and stay on User.
+  type PublicUser {
+    _id: String!
+    username: String!
+    avatar: String
+    recipeCount: Int!
+    # Newest first, with the viewer's own like/favorite flags.
+    recipes: [Recipe!]!
+  }
+
+  type UsernameCheck {
+    available: Boolean!
+    # Why not, in words meant for the user. Null when available.
+    message: String
+  }
+
   type Ingredient {
     name: String!
     amount: Float
@@ -78,6 +127,8 @@ export const typeDefs = `#graphql
     notes: String
   }
 
+  # Everything after imageUrl is optional. Omitted fields keep the plain
+  # recipe page: no story, no extra photos, CLASSIC layout, PLUM accent.
   input RecipeInput {
     title: String!
     ingredients: [IngredientInput!]!
@@ -85,6 +136,12 @@ export const typeDefs = `#graphql
     prepTime: Int!
     content: String
     imageUrl: String
+    # Markdown, up to 20000 characters.
+    story: String
+    # Up to 8 photos uploaded through this site.
+    gallery: [String!]
+    layout: RecipeLayout
+    accent: RecipeAccent
   }
 
   input IngredientInput {
@@ -128,5 +185,8 @@ export const typeDefs = `#graphql
     addComment(recipeId: String!, body: String!): Comment!
     # The comment's author, the recipe's author, or an admin.
     deleteComment(_id: String!): Boolean!
+    # Renames the caller. Same rules as checkUsername; the old name redirects
+    # to the new one for a while and cannot be taken by anyone else meanwhile.
+    updateUsername(username: String!): User!
   }
 `;

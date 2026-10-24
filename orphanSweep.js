@@ -13,18 +13,25 @@ import { cloudinary, publicIdFromUrl } from './cloudinary.js';
 //     before tagging existed) is left alone.
 //  2. A grace period, so a photo on a form someone is still filling in is
 //     never swept. Uploads newer than graceHours are skipped.
-//  3. The reference set is every imageUrl in the recipes collection this
-//     process is connected to. The folder and that database must belong
-//     together; see the README about per-environment folders.
+//  3. The reference set is every imageUrl and every gallery photo in the
+//     recipes collection this process is connected to. The folder and that
+//     database must belong together; see the README about per-environment
+//     folders.
 export const sweepOrphanPhotos = async ({ graceHours = 24, dryRun = true } = {}) => {
   if(!cloudinaryConfig) return { skipped: 'Cloudinary is not configured', dryRun };
 
   const recipeList = await recipeCollection();
   const withPhotos = await recipeList
-    .find({ imageUrl: { $type: 'string' } }, { projection: { imageUrl: 1 } })
+    .find(
+      { $or: [{ imageUrl: { $type: 'string' } }, { 'gallery.0': { $exists: true } }] },
+      { projection: { imageUrl: 1, gallery: 1 } }
+    )
     .toArray();
   const referenced = new Set(
-    withPhotos.map((r) => publicIdFromUrl(r.imageUrl)).filter(Boolean)
+    withPhotos
+      .flatMap((r) => [r.imageUrl, ...(r.gallery ?? [])])
+      .map((url) => publicIdFromUrl(url))
+      .filter(Boolean)
   );
 
   const assets = await cloudinary.listFolderImages();

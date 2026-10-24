@@ -1,9 +1,16 @@
 import { randomBytes } from 'node:crypto';
 import { GraphQLError } from 'graphql';
 import { ObjectId } from 'mongodb';
-import helpers from './helpers.js';
+import helpers, { DEFAULT_LAYOUT, DEFAULT_ACCENT } from './helpers.js';
 import { signParams, cloudinary } from './cloudinary.js';
 import { authConfig, cloudinaryConfig } from './config/settings.js';
+import {
+  validateUsername,
+  usernameFromNickname,
+  withUsernameSuffix,
+  usernameKey,
+  PREVIOUS_NAME_HOLD_DAYS
+} from './usernames.js';
 import {
   recipes as recipeCollection,
   users as userCollection,
@@ -29,19 +36,61 @@ const profileFromClaims = (claims) => {
   };
 };
 
-//email and username are non-nullable in the schema, so refuse to persist a user
-//without them rather than writing a document that can never be read back.
+//email is non-nullable in the schema, so refuse to persist a user without it
+//rather than writing a document that can never be read back. A missing
+//username is not fatal: one is generated (see usernameFromNickname).
 const requireProfile = (profile) => {
-  const missing = ['email', 'username'].filter((field) => !profile[field]);
-  if(missing.length){
+  if(!profile.email){
     throw new GraphQLError(
-      `Token is missing required profile claim(s): ${missing.join(', ')}. ` +
+      `Token is missing the required profile claim: email. ` +
       `Add an Auth0 Action that sets ${authConfig.audience}/email and ` +
       `${authConfig.audience}/username on the access token.`,
       { extensions: {code: 'BAD_USER_INPUT'} }
     );
   }
   return profile;
+};
+
+const USERNAME_ATTEMPTS = 5;
+const couldNotPickUsername = () =>
+  new GraphQLError('Could not pick a username. Please try again.', {
+    extensions: { code: 'INTERNAL_SERVER_ERROR' }
+  });
+
+//First login. The Auth0 nickname, made to fit the username rules, with a
+//random suffix if someone already has it. Collisions are detected by the
+//unique index rather than a lookup first, so two simultaneous first logins
+//cannot both end up with the same name.
+const insertWithUniqueUsername = async (userList, doc, nickname) => {
+  let username = usernameFromNickname(nickname);
+  for(let attempt = 0; attempt < USERNAME_ATTEMPTS; attempt++){
+    try {
+      const insertInfo = await userList.insertOne({ ...doc, username, usernameLower: usernameKey(username) });
+      return userList.findOne({ _id: insertInfo.insertedId });
+    } catch (e) {
+      if(!isDuplicateKey(e)) throw e;
+      //The same account logging in twice at once: the other request won.
+      const existing = await userList.findOne({ auth0Id: doc.auth0Id });
+      if(existing) return existing;
+      username = withUsernameSuffix(usernameFromNickname(nickname));
+    }
+  }
+  throw couldNotPickUsername();
+};
+
+//Same idea for an old record that was stored without a username.
+const repairUsername = async (userList, _id, nickname) => {
+  let username = usernameFromNickname(nickname);
+  for(let attempt = 0; attempt < USERNAME_ATTEMPTS; attempt++){
+    try {
+      await userList.updateOne({ _id }, { $set: { username, usernameLower: usernameKey(username) } });
+      return;
+    } catch (e) {
+      if(!isDuplicateKey(e)) throw e;
+      username = withUsernameSuffix(usernameFromNickname(nickname));
+    }
+  }
+  throw couldNotPickUsername();
 };
 
 //The configured ADMIN_EMAIL is the source of truth for who is admin. Only a
@@ -79,25 +128,21 @@ const requireAccount = async (context) => {
     const newUser = {
       auth0Id: claims.sub,
       email: profile.email,
-      username: profile.username,
       avatar: profile.avatar,
       createdAt: new Date().toISOString(),
-      role: isConfiguredAdmin(profile) ? "admin" : "user"
+      role: isConfiguredAdmin(profile) ? "admin" : "user",
+      previousUsernames: []
     };
-    const insertInfo = await userList.insertOne(newUser);
-    currentUser = await userList.findOne({ _id: insertInfo.insertedId });
+    currentUser = await insertWithUniqueUsername(userList, newUser, profile.username);
   } else if(!currentUser.email || !currentUser.username){
     //Repairs records written before the claims were validated, which the
     //mongo driver stored with the undefined fields dropped entirely.
     requireProfile(profile);
     await userList.updateOne(
       { _id: currentUser._id },
-      { $set: {
-        email: profile.email,
-        username: profile.username,
-        avatar: currentUser.avatar ?? profile.avatar
-      } }
+      { $set: { email: profile.email, avatar: currentUser.avatar ?? profile.avatar } }
     );
+    if(!currentUser.username) await repairUsername(userList, currentUser._id, profile.username);
     currentUser = await userList.findOne({ _id: currentUser._id });
   }
 
@@ -149,6 +194,73 @@ const toAuthor = (user) =>
     ? { _id: user._id.toString(), username: user.username, avatar: user.avatar ?? null }
     : null;
 
+//The caller's own record as `me` and updateUsername return it. The schema
+//exposes only the declared fields, so the extra keys on the document
+//(usernameLower, previousUsernames) never leave the server.
+const serializeUser = (user) => ({
+  ...user,
+  _id: user._id.toString(),
+  avatar: user.avatar ?? null
+});
+
+//Why `usernameLower` is not available to `user` right now, in the user's
+//words, or null when it is. Someone else's current name is taken; a name
+//someone else gave up within the hold period is parked, so a rename cannot
+//scoop up a handle that still redirects to its old owner.
+const usernameConflict = async (userList, usernameLower, user) => {
+  const owner = await userList.findOne({ usernameLower }, { projection: { _id: 1 } });
+  if(owner && !owner._id.equals(user._id)) return 'That username is taken.';
+  const since = new Date(Date.now() - PREVIOUS_NAME_HOLD_DAYS * 24 * 60 * 60 * 1000).toISOString();
+  const held = await userList.findOne(
+    { _id: { $ne: user._id }, previousUsernames: { $elemMatch: { usernameLower, changedAt: { $gte: since } } } },
+    { projection: { _id: 1 } }
+  );
+  if(held) return 'That username was given up recently and is not available yet.';
+  return null;
+};
+
+//The public view of a user document. Never the email, role or Auth0 id.
+const toPublicUser = (user) => ({
+  _id: user._id.toString(),
+  username: user.username,
+  avatar: user.avatar ?? null
+});
+
+//Finds the owner of a username: the current holder, or failing that the
+//most recent previous holder so a stale link still lands somewhere.
+const findUserByUsername = async (username) => {
+  if(typeof username !== 'string') return null;
+  const key = usernameKey(username.trim());
+  if(!key || key.length > 64) return null;
+  const userList = await userCollection();
+  const current = await userList.findOne({ usernameLower: key });
+  if(current) return current;
+  const previous = await userList.find({ 'previousUsernames.usernameLower': key }).toArray();
+  if(previous.length === 0) return null;
+  const changedAt = (u) =>
+    Math.max(...u.previousUsernames.filter((p) => p.usernameLower === key).map((p) => Date.parse(p.changedAt) || 0));
+  return previous.sort((a, b) => changedAt(b) - changedAt(a))[0];
+};
+
+//A public profile's recipes, newest first, loaded once per request however
+//many of its fields ask (same pattern as loadProfileLists below).
+const publicRecipeLists = new WeakMap();
+const loadPublicRecipes = (parent, context) => {
+  let pending = publicRecipeLists.get(parent);
+  if(!pending){
+    pending = (async () => {
+      const recipeList = await recipeCollection();
+      const docs = await recipeList
+        .find({ authorId: new ObjectId(parent._id) })
+        .sort({ createdAt: -1, _id: -1 })
+        .toArray();
+      return present(docs, await findViewer(context));
+    })();
+    publicRecipeLists.set(parent, pending);
+  }
+  return pending;
+};
+
 //Attaches `author` to each recipe with one users query instead of one per
 //recipe. Recipes without an authorId get null.
 const attachAuthors = async (recipeDocs) => {
@@ -197,7 +309,12 @@ const serializeRecipe = (recipe) => ({
   author: recipe.author ?? null,
   likedByMe: recipe.likedByMe ?? false,
   favoritedByMe: recipe.favoritedByMe ?? false,
-  commentCount: recipe.commentCount ?? 0
+  commentCount: recipe.commentCount ?? 0,
+  //Page settings. Recipes from before these existed read as the plain page.
+  story: recipe.story ?? null,
+  gallery: recipe.gallery ?? [],
+  layout: recipe.layout ?? DEFAULT_LAYOUT,
+  accent: recipe.accent ?? DEFAULT_ACCENT
 });
 
 //A comment as the API returns it. canDelete is decided for the viewer here
@@ -274,21 +391,63 @@ const setReaction = async (context, _id, { collection, on, counter = null }) => 
   return presented;
 };
 
-//The recipes behind a user's reaction rows, most recently reacted first.
-const reactedRecipes = async (collection, user) => {
-  const rows = await collection();
-  const reactions = await rows
-    .find({ userId: user._id })
-    .sort({ createdAt: -1, _id: -1 })
-    .project({ recipeId: 1 })
-    .toArray();
-  if(reactions.length === 0) return [];
-  const recipeList = await recipeCollection();
-  const docs = await recipeList.find({ _id: { $in: reactions.map((r) => r.recipeId) } }).toArray();
-  const byId = new Map(docs.map((d) => [d._id.toString(), d]));
-  //Keep the reaction order; a recipe deleted in the meantime just drops out.
-  const ordered = reactions.map((r) => byId.get(r.recipeId.toString())).filter(Boolean);
-  return present(ordered, user);
+//The three profile tabs. They are sibling fields on `me`, which graphql-js
+//resolves concurrently, and resolved one by one each walked the same chain
+//(reaction rows, then recipes, then authors, then the viewer's reactions
+//again): fourteen queries, five round trips deep, for one page. Loaded
+//together instead: the like rows, favorite rows and own posts in parallel,
+//then the recipes behind the reactions that are not already in hand, then
+//their authors. The viewer's flags come straight from the rows, so
+//markForViewer is not needed. Five queries, three round trips.
+//
+//Keyed by the parent object: `me` builds a fresh one per request, so the
+//three resolvers share one load and nothing outlives the request.
+const profileLists = new WeakMap();
+const loadProfileLists = (user) => {
+  let pending = profileLists.get(user);
+  if(!pending){
+    pending = (async () => {
+      const owner = new ObjectId(user._id);
+      const [recipeList, likeRows, favoriteRows] = await Promise.all([
+        recipeCollection(), likeCollection(), favoriteCollection()
+      ]);
+      //Most recently reacted first; the user_recent index serves the sort.
+      const reactionsOf = (rows) =>
+        rows.find({ userId: owner }).sort({ createdAt: -1, _id: -1 }).project({ recipeId: 1 }).toArray();
+      const [own, likes, favorites] = await Promise.all([
+        recipeList.find({ authorId: owner }).sort({ createdAt: -1, _id: -1 }).toArray(),
+        reactionsOf(likeRows),
+        reactionsOf(favoriteRows)
+      ]);
+      const liked = new Set(likes.map((r) => r.recipeId.toString()));
+      const favorited = new Set(favorites.map((r) => r.recipeId.toString()));
+
+      const byId = new Map(own.map((d) => [d._id.toString(), d]));
+      const missing = [...new Set([...liked, ...favorited])].filter((id) => !byId.has(id));
+      if(missing.length > 0){
+        const docs = await recipeList
+          .find({ _id: { $in: missing.map((id) => new ObjectId(id)) } })
+          .toArray();
+        for(const d of docs) byId.set(d._id.toString(), d);
+      }
+
+      const presented = new Map(
+        (await attachAuthors([...byId.values()])).map((r) => {
+          const id = r._id.toString();
+          return [id, serializeRecipe({ ...r, likedByMe: liked.has(id), favoritedByMe: favorited.has(id) })];
+        })
+      );
+      //Keep each list's own order; a recipe deleted in the meantime drops out.
+      const inOrder = (rows) => rows.map((r) => presented.get(r.recipeId.toString())).filter(Boolean);
+      return {
+        recipes: own.map((d) => presented.get(d._id.toString())),
+        likedRecipes: inOrder(likes),
+        favoriteRecipes: inOrder(favorites)
+      };
+    })();
+    profileLists.set(user, pending);
+  }
+  return pending;
 };
 
 //Mongo raises E11000 when a write violates the unique slug index. With many
@@ -368,14 +527,39 @@ export const resolvers = {
       return presented;
     },
 
-    me: async (_, __, context) => {
-      const currentUser = await requireAccount(context);
-      return {
-        ...currentUser,
-        _id: currentUser._id.toString(),
-        avatar: currentUser.avatar ?? null
-      };
+    me: async (_, __, context) => serializeUser(await requireAccount(context)),
+
+    //Anyone, signed in or not. Null rather than an error for an unknown
+    //name, so the page can show its own "no one here" state.
+    user: async (_, { username }) => {
+      const found = await findUserByUsername(username);
+      return found ? toPublicUser(found) : null;
     },
+
+    //Live validation for the rename form. Signed-in only, so the check is
+    //not a free enumeration endpoint for visitors. Rule failures come back
+    //as {available: false, message}; only unexpected errors are thrown.
+    checkUsername: async (_, { username }, context) => {
+      const user = await requireAccount(context);
+      let next;
+      try {
+        next = validateUsername(username);
+      } catch (e) {
+        if(e instanceof GraphQLError) return { available: false, message: e.message };
+        throw e;
+      }
+      if(next.username === user.username){
+        return { available: true, message: "That's your current username." };
+      }
+      const conflict = await usernameConflict(await userCollection(), next.usernameLower, user);
+      return conflict ? { available: false, message: conflict } : { available: true, message: null };
+    },
+  },
+
+  //A public profile's lists share one load; see loadPublicRecipes.
+  PublicUser: {
+    recipeCount: async (user, _, context) => (await loadPublicRecipes(user, context)).length,
+    recipes: (user, _, context) => loadPublicRecipes(user, context),
   },
 
   //Resolved only when a query asks for it, so list queries never pay for
@@ -388,22 +572,12 @@ export const resolvers = {
       ),
   },
 
-  //Profile tabs. The parent is the serialized `me` object, so _id comes back
-  //as a string and is rebuilt into an ObjectId for the lookups.
+  //Profile tabs. The parent is the serialized `me` object (string _id); the
+  //three fields share one load, see loadProfileLists.
   User: {
-    recipes: async (user) => {
-      const recipeList = await recipeCollection();
-      const owner = { ...user, _id: new ObjectId(user._id) };
-      const docs = await recipeList
-        .find({ authorId: owner._id })
-        .sort({ createdAt: -1, _id: -1 })
-        .toArray();
-      return present(docs, owner);
-    },
-    likedRecipes: (user) =>
-      reactedRecipes(likeCollection, { ...user, _id: new ObjectId(user._id) }),
-    favoriteRecipes: (user) =>
-      reactedRecipes(favoriteCollection, { ...user, _id: new ObjectId(user._id) }),
+    recipes: async (user) => (await loadProfileLists(user)).recipes,
+    likedRecipes: async (user) => (await loadProfileLists(user)).likedRecipes,
+    favoriteRecipes: async (user) => (await loadProfileLists(user)).favoriteRecipes,
   },
 
   Mutation: {
@@ -443,11 +617,12 @@ export const resolvers = {
         )
       );
       if(!updated) throw notFound();
-      //A replaced or removed photo would otherwise sit in Cloudinary forever.
-      //Runs after the edit is committed and never fails it.
-      if(existing.imageUrl && existing.imageUrl !== updated.imageUrl){
-        await cloudinary.destroyImage(existing.imageUrl);
-      }
+      //Photos that left the recipe (replaced cover, removed gallery shots)
+      //would otherwise sit in Cloudinary forever. Runs after the edit is
+      //committed and never fails it.
+      const before = [existing.imageUrl, ...(existing.gallery ?? [])].filter(Boolean);
+      const after = new Set([updated.imageUrl, ...(updated.gallery ?? [])].filter(Boolean));
+      await Promise.all(before.filter((url) => !after.has(url)).map((url) => cloudinary.destroyImage(url)));
       const [presented] = await present([updated], user);
       return presented;
     },
@@ -502,10 +677,45 @@ export const resolvers = {
         likeList.deleteMany({ recipeId: recipe._id }),
         favoriteList.deleteMany({ recipeId: recipe._id }),
         commentList.deleteMany({ recipeId: recipe._id }),
-        //The photo too. Best effort; see cloudinary.js.
-        recipe.imageUrl ? cloudinary.destroyImage(recipe.imageUrl) : null
+        //The photos too. Best effort; see cloudinary.js.
+        ...[recipe.imageUrl, ...(recipe.gallery ?? [])].filter(Boolean).map((url) => cloudinary.destroyImage(url))
       ]);
       return true;
+    },
+
+    //Renames the caller. A change of case alone keeps the same key and needs
+    //no redirect; a new name parks the old one in previousUsernames so
+    ///u/<old> still finds this account and nobody else can claim it for a
+    //while. The unique index is the final word on collisions.
+    updateUsername: async (_, { username }, context) => {
+      const user = await requireAccount(context);
+      const next = validateUsername(username);
+      if(next.username === user.username) return serializeUser(user);
+
+      const userList = await userCollection();
+      const conflict = await usernameConflict(userList, next.usernameLower, user);
+      if(conflict) throw new GraphQLError(conflict, { extensions: { code: 'BAD_USER_INPUT' } });
+
+      const update = { $set: { username: next.username, usernameLower: next.usernameLower } };
+      if(next.usernameLower !== user.usernameLower){
+        update.$push = {
+          previousUsernames: {
+            $each: [{ username: user.username, usernameLower: user.usernameLower, changedAt: new Date().toISOString() }],
+            $slice: -10
+          }
+        };
+      }
+      let updated;
+      try {
+        updated = await userList.findOneAndUpdate({ _id: user._id }, update, { returnDocument: 'after' });
+      } catch (e) {
+        if(isDuplicateKey(e)){
+          throw new GraphQLError('That username is taken.', { extensions: { code: 'BAD_USER_INPUT' } });
+        }
+        throw e;
+      }
+      if(!updated) throw new GraphQLError('User Not Found', { extensions: { code: 'NOT_FOUND' } });
+      return serializeUser(updated);
     },
 
     addComment: async (_, { recipeId, body }, context) => {
