@@ -274,21 +274,63 @@ const setReaction = async (context, _id, { collection, on, counter = null }) => 
   return presented;
 };
 
-//The recipes behind a user's reaction rows, most recently reacted first.
-const reactedRecipes = async (collection, user) => {
-  const rows = await collection();
-  const reactions = await rows
-    .find({ userId: user._id })
-    .sort({ createdAt: -1, _id: -1 })
-    .project({ recipeId: 1 })
-    .toArray();
-  if(reactions.length === 0) return [];
-  const recipeList = await recipeCollection();
-  const docs = await recipeList.find({ _id: { $in: reactions.map((r) => r.recipeId) } }).toArray();
-  const byId = new Map(docs.map((d) => [d._id.toString(), d]));
-  //Keep the reaction order; a recipe deleted in the meantime just drops out.
-  const ordered = reactions.map((r) => byId.get(r.recipeId.toString())).filter(Boolean);
-  return present(ordered, user);
+//The three profile tabs. They are sibling fields on `me`, which graphql-js
+//resolves concurrently, and resolved one by one each walked the same chain
+//(reaction rows, then recipes, then authors, then the viewer's reactions
+//again): fourteen queries, five round trips deep, for one page. Loaded
+//together instead: the like rows, favorite rows and own posts in parallel,
+//then the recipes behind the reactions that are not already in hand, then
+//their authors. The viewer's flags come straight from the rows, so
+//markForViewer is not needed. Five queries, three round trips.
+//
+//Keyed by the parent object: `me` builds a fresh one per request, so the
+//three resolvers share one load and nothing outlives the request.
+const profileLists = new WeakMap();
+const loadProfileLists = (user) => {
+  let pending = profileLists.get(user);
+  if(!pending){
+    pending = (async () => {
+      const owner = new ObjectId(user._id);
+      const [recipeList, likeRows, favoriteRows] = await Promise.all([
+        recipeCollection(), likeCollection(), favoriteCollection()
+      ]);
+      //Most recently reacted first; the user_recent index serves the sort.
+      const reactionsOf = (rows) =>
+        rows.find({ userId: owner }).sort({ createdAt: -1, _id: -1 }).project({ recipeId: 1 }).toArray();
+      const [own, likes, favorites] = await Promise.all([
+        recipeList.find({ authorId: owner }).sort({ createdAt: -1, _id: -1 }).toArray(),
+        reactionsOf(likeRows),
+        reactionsOf(favoriteRows)
+      ]);
+      const liked = new Set(likes.map((r) => r.recipeId.toString()));
+      const favorited = new Set(favorites.map((r) => r.recipeId.toString()));
+
+      const byId = new Map(own.map((d) => [d._id.toString(), d]));
+      const missing = [...new Set([...liked, ...favorited])].filter((id) => !byId.has(id));
+      if(missing.length > 0){
+        const docs = await recipeList
+          .find({ _id: { $in: missing.map((id) => new ObjectId(id)) } })
+          .toArray();
+        for(const d of docs) byId.set(d._id.toString(), d);
+      }
+
+      const presented = new Map(
+        (await attachAuthors([...byId.values()])).map((r) => {
+          const id = r._id.toString();
+          return [id, serializeRecipe({ ...r, likedByMe: liked.has(id), favoritedByMe: favorited.has(id) })];
+        })
+      );
+      //Keep each list's own order; a recipe deleted in the meantime drops out.
+      const inOrder = (rows) => rows.map((r) => presented.get(r.recipeId.toString())).filter(Boolean);
+      return {
+        recipes: own.map((d) => presented.get(d._id.toString())),
+        likedRecipes: inOrder(likes),
+        favoriteRecipes: inOrder(favorites)
+      };
+    })();
+    profileLists.set(user, pending);
+  }
+  return pending;
 };
 
 //Mongo raises E11000 when a write violates the unique slug index. With many
@@ -388,22 +430,12 @@ export const resolvers = {
       ),
   },
 
-  //Profile tabs. The parent is the serialized `me` object, so _id comes back
-  //as a string and is rebuilt into an ObjectId for the lookups.
+  //Profile tabs. The parent is the serialized `me` object (string _id); the
+  //three fields share one load, see loadProfileLists.
   User: {
-    recipes: async (user) => {
-      const recipeList = await recipeCollection();
-      const owner = { ...user, _id: new ObjectId(user._id) };
-      const docs = await recipeList
-        .find({ authorId: owner._id })
-        .sort({ createdAt: -1, _id: -1 })
-        .toArray();
-      return present(docs, owner);
-    },
-    likedRecipes: (user) =>
-      reactedRecipes(likeCollection, { ...user, _id: new ObjectId(user._id) }),
-    favoriteRecipes: (user) =>
-      reactedRecipes(favoriteCollection, { ...user, _id: new ObjectId(user._id) }),
+    recipes: async (user) => (await loadProfileLists(user)).recipes,
+    likedRecipes: async (user) => (await loadProfileLists(user)).likedRecipes,
+    favoriteRecipes: async (user) => (await loadProfileLists(user)).favoriteRecipes,
   },
 
   Mutation: {
