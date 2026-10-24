@@ -15,7 +15,7 @@
   "main": "app.js",
   "type": "module",
   "scripts": {
-    "test": "echo \"Error: no test specified\" && exit 1",
+    "test": "node --test",
     "start": "node --env-file-if-exists=.env app.js",
     "sweep-orphans": "node --env-file-if-exists=.env scripts/sweepOrphans.js"
   },
@@ -29,6 +29,7 @@
     "jsonwebtoken": "^9.0.3",
     "jwks-rsa": "^3.2.2",
     "mongodb": "^7.0.0",
+    "obscenity": "^0.4.6",
     "redis": "^5.10.0",
     "slugify": "^1.6.9"
   }
